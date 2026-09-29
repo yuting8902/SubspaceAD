@@ -15,6 +15,7 @@ python main.py \
     --pca_ev 0.99 \
     --score_method reconstruction \
     --img_score_agg mtop1p \
+    --threshold_policy fpr_constrained \
     --target_img_fpr 0.01 \
     --batch_size 1 \
     --save_intro_overlays \

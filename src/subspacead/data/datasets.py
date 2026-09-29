@@ -62,7 +62,7 @@ class BaseDatasetHandler:
         return Path(image_path).parent.name
 
     def get_image_label(self, image_path: str) -> int:
-        """0=normal, 1=anomaly using the test subfolder name."""
+        """0=normal, 1=anomaly using the immediate parent folder name."""
         defect_type = self.get_defect_type(image_path).lower()
         return 0 if defect_type in _NORMAL_FOLDER_NAMES else 1
 
@@ -96,7 +96,6 @@ class MVTecLOCODataset(BaseDatasetHandler):
         anomaly_type = p.parent.name
         if anomaly_type.lower() == "good":
             return None
-
         candidates = [
             self.category_path / "ground_truth" / anomaly_type / f"{p.stem}_mask.png",
             self.category_path / "ground_truth" / anomaly_type / p.stem / "000.png",
@@ -150,12 +149,19 @@ class WaferDataset(BaseDatasetHandler):
 
     Expected structure:
         train_root/<category>/train/good/*
+
         val_root/<category>/val/good/*
+        val_root/<category>/val/<anomaly_type>/*
+
         test_root/<category>/test/good/*
         test_root/<category>/test/<anomaly_type>/*
 
     Any '.ipynb_checkpoints' directory is ignored recursively.
     Ground-truth segmentation masks are intentionally not required.
+
+    For validation/test image-level labels:
+        parent folder 'good' or 'normal' -> 0 (normal)
+        every other parent folder         -> 1 (anomaly)
     """
 
     def __init__(self, root_path, category):
@@ -165,7 +171,6 @@ class WaferDataset(BaseDatasetHandler):
         train_root = os.environ.get("SUBSPACEAD_WAFER_TRAIN_ROOT", str(root_path))
         val_root = os.environ.get("SUBSPACEAD_WAFER_VAL_ROOT")
         test_root = os.environ.get("SUBSPACEAD_WAFER_TEST_ROOT")
-
         if not test_root:
             raise ValueError(
                 "Wafer test root is missing. Run with --dataset_name wafer "
@@ -182,7 +187,8 @@ class WaferDataset(BaseDatasetHandler):
     def get_validation_paths(self):
         if self.val_category_path is None:
             return []
-        return _list_images(self.val_category_path / "val" / "good")
+        # Mixed validation is supported: good/normal plus any anomaly subfolders.
+        return _list_images(self.val_category_path / "val", recursive=True)
 
     def get_test_paths(self):
         # Supports normal-only, anomaly-only, or mixed test sets.

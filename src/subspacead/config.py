@@ -15,7 +15,10 @@ def parse_grouped_layers(arg_str: str):
 
 
 def _validate_wafer_roots(parser: argparse.ArgumentParser, args):
-    """Validate custom wafer roots while keeping main.py compatible."""
+    """Validate arguments and map custom wafer roots for main.py compatibility."""
+    if not 0.0 <= args.target_img_fpr <= 1.0:
+        parser.error("--target_img_fpr must be in [0, 1].")
+
     if args.dataset_name != "wafer":
         if not args.dataset_path:
             parser.error("--dataset_path is required for non-wafer datasets.")
@@ -26,13 +29,12 @@ def _validate_wafer_roots(parser: argparse.ArgumentParser, args):
     if not args.test_root:
         parser.error("--test_root is required when --dataset_name wafer.")
 
-    # Official main.py discovers categories from args.dataset_path and passes that
-    # value to get_dataset_handler(). Point it at train_root for compatibility.
+    # main.py discovers categories from args.dataset_path and passes that value to
+    # get_dataset_handler(). Point it at train_root for compatibility.
     args.dataset_path = args.train_root
 
-    # The official get_dataset_handler() signature only receives one root path.
-    # Store the additional split roots in process-local environment variables so
-    # datasets.py can retrieve them without changing official main.py.
+    # get_dataset_handler() receives one root path. Store the additional wafer
+    # split roots in process-local environment variables for datasets.py.
     os.environ["SUBSPACEAD_WAFER_TRAIN_ROOT"] = os.path.abspath(args.train_root)
     os.environ["SUBSPACEAD_WAFER_TEST_ROOT"] = os.path.abspath(args.test_root)
     if args.val_root:
@@ -81,7 +83,11 @@ def get_args():
         "--val_root",
         type=str,
         default=None,
-        help="Wafer validation root: <val_root>/<category>/val/good/. Optional.",
+        help=(
+            "Wafer validation root: <val_root>/<category>/val/<type>/. "
+            "Folders named 'good' or 'normal' are normal; all other type folders "
+            "are treated as anomaly. Optional."
+        ),
     )
     data_group.add_argument(
         "--test_root",
@@ -94,7 +100,10 @@ def get_args():
         type=str,
         nargs="+",
         default=None,
-        help="Categories to run. If omitted, categories are discovered from train_root/dataset_path.",
+        help=(
+            "Categories to run. If omitted, categories are discovered from "
+            "train_root/dataset_path."
+        ),
     )
 
     # ---------------- Backbone / features ----------------
@@ -131,7 +140,10 @@ def get_args():
         "--model_ckpt",
         type=str,
         default="facebook/dinov2-with-registers-large",
-        help="Hugging Face model directory/checkpoint. For offline H0, pass the local DINOv2-L/14-Reg folder.",
+        help=(
+            "Hugging Face model directory/checkpoint. For offline H0, pass the "
+            "local DINOv2-L/14-Reg folder."
+        ),
     )
     model_group.add_argument(
         "--anomalyvfm_root",
@@ -168,7 +180,10 @@ def get_args():
         "--k_shot",
         type=int,
         default=None,
-        help="Number of normal training images to use. Omit to use all training images.",
+        help=(
+            "Number of normal training images to use. Omit to use all training "
+            "images."
+        ),
     )
     model_group.add_argument(
         "--agg_method",
@@ -192,7 +207,10 @@ def get_args():
         type=str,
         nargs="+",
         default=["rotate"],
-        help="Choices supported by transforms.py include hflip, vflip, rotate, color_jitter, affine.",
+        help=(
+            "Choices supported by transforms.py include hflip, vflip, rotate, "
+            "color_jitter, affine."
+        ),
     )
     aug_group.add_argument(
         "--no_aug_categories",
@@ -230,16 +248,35 @@ def get_args():
     )
     score_group.add_argument("--pro_integration_limit", type=float, default=0.3)
     score_group.add_argument(
+        "--threshold_policy",
+        type=str,
+        default="best_f1",
+        choices=["best_f1", "fpr_constrained"],
+        help=(
+            "Image-level threshold selection for mixed normal+anomaly validation. "
+            "'best_f1' maximizes validation F1. 'fpr_constrained' maximizes "
+            "anomaly recall subject to validation FPR <= --target_img_fpr. "
+            "Normal-only validation keeps the original quantile fallback."
+        ),
+    )
+    score_group.add_argument(
         "--target_img_fpr",
         type=float,
         default=0.05,
-        help="When validation contains only normal images, choose the image threshold at this target validation FPR.",
+        help=(
+            "Target image-level validation FPR. Used as the constraint for "
+            "--threshold_policy fpr_constrained and as the normal-only quantile "
+            "fallback target."
+        ),
     )
     score_group.add_argument(
         "--target_px_fpr",
         type=float,
         default=0.05,
-        help="Pixel fallback FPR. Not meaningful for the wafer dataset because no GT masks are supplied.",
+        help=(
+            "Pixel fallback FPR. Not meaningful for the wafer dataset because "
+            "no GT masks are supplied."
+        ),
     )
     score_group.add_argument(
         "--use_d1_denoise",
@@ -263,8 +300,8 @@ def get_args():
         type=float,
         default=0.5,
         help=(
-            "D1 background subtraction strength in [0,1]. "
-            "0 disables subtraction; 1 subtracts the full estimated background."
+            "D1 background subtraction strength in [0,1]. 0 disables "
+            "subtraction; 1 subtracts the full estimated background."
         ),
     )
     score_group.add_argument(

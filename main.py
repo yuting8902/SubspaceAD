@@ -56,6 +56,8 @@ DATASET_COUNT_COLUMNS = [
     "category",
     "train_good_count",
     "val_good_count",
+    "val_bad_count",
+    "val_total_count",
     "test_good_count",
     "test_bad_count",
     "test_total_count",
@@ -115,13 +117,133 @@ def _quantile_threshold_from_negatives(y_true, y_score, target_fpr=0.05):
         return float(np.quantile(neg, q, interpolation="linear"))
 
 
-def _pick_threshold_with_fallback(y_true, y_score, target_fpr):
-    thr_pr, _ = _best_f1_threshold_from_scores(y_true, y_score)
-    if thr_pr is not None:
-        return thr_pr, "pr"
-    thr_q = _quantile_threshold_from_negatives(y_true, y_score, target_fpr)
-    if thr_q is not None:
-        return thr_q, "quantile"
+def _classification_stats_from_scores(y_true, y_score, threshold):
+    """Return image-level classification statistics at a fixed threshold."""
+    y_true = np.asarray(y_true).astype(np.uint8)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    if y_true.size == 0 or y_score.size == 0 or threshold is None:
+        return {}
+    if y_true.size != y_score.size:
+        raise ValueError("y_true and y_score must have the same length.")
+
+    y_pred = y_score >= float(threshold)
+    pos = y_true == 1
+    neg = y_true == 0
+
+    tp = int(np.sum(pos & y_pred))
+    tn = int(np.sum(neg & ~y_pred))
+    fp = int(np.sum(neg & y_pred))
+    fn = int(np.sum(pos & ~y_pred))
+
+    precision = _safe_ratio(tp, tp + fp)
+    recall = _safe_ratio(tp, tp + fn)
+    fpr = _safe_ratio(fp, fp + tn)
+    f1 = (
+        float(2.0 * precision * recall / (precision + recall))
+        if np.isfinite(precision)
+        and np.isfinite(recall)
+        and (precision + recall) > 0
+        else 0.0
+    )
+    return {
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "precision": precision,
+        "recall": recall,
+        "fpr": fpr,
+        "f1": f1,
+    }
+
+
+def _fpr_constrained_threshold_from_scores(y_true, y_score, target_fpr=0.05):
+    """
+    Maximize anomaly recall subject to empirical validation FPR <= target_fpr.
+
+    Ties are resolved by preferring, in order:
+      1) lower FPR,
+      2) higher precision,
+      3) higher (more conservative) threshold.
+    """
+    y_true = np.asarray(y_true).astype(np.uint8)
+    y_score = np.asarray(y_score, dtype=np.float64)
+
+    if y_true.size == 0 or y_score.size == 0:
+        return None, {}
+    if y_true.size != y_score.size:
+        raise ValueError("y_true and y_score must have the same length.")
+    if not np.any(y_true == 0) or not np.any(y_true == 1):
+        return None, {}
+
+    target_fpr = float(np.clip(target_fpr, 0.0, 1.0))
+
+    # Predictions only change when the threshold crosses an observed score.
+    # Include one value above the maximum so FPR=0 is always a feasible candidate.
+    candidates = np.unique(y_score)
+    candidates = np.append(candidates, np.nextafter(np.max(y_score), np.inf))
+
+    best_threshold = None
+    best_stats = {}
+    best_key = None
+
+    for threshold in candidates:
+        stats = _classification_stats_from_scores(y_true, y_score, threshold)
+        fpr = stats["fpr"]
+        recall = stats["recall"]
+        precision = stats["precision"]
+
+        if not np.isfinite(fpr) or not np.isfinite(recall):
+            continue
+        if fpr > target_fpr + 1e-12:
+            continue
+
+        precision_key = precision if np.isfinite(precision) else -np.inf
+        key = (
+            recall,
+            -fpr,
+            precision_key,
+            float(threshold),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_threshold = float(threshold)
+            best_stats = stats
+
+    return best_threshold, best_stats
+
+
+def _pick_threshold_with_fallback(
+    y_true,
+    y_score,
+    target_fpr,
+    threshold_policy="best_f1",
+):
+    """Select an image threshold, with normal-only quantile as the fallback."""
+    y_true = np.asarray(y_true).astype(np.uint8)
+    has_normal = np.any(y_true == 0)
+    has_anomaly = np.any(y_true == 1)
+
+    if has_normal and has_anomaly:
+        if threshold_policy == "best_f1":
+            threshold, _ = _best_f1_threshold_from_scores(y_true, y_score)
+            if threshold is not None:
+                return threshold, "best_f1"
+        elif threshold_policy == "fpr_constrained":
+            threshold, _ = _fpr_constrained_threshold_from_scores(
+                y_true, y_score, target_fpr
+            )
+            if threshold is not None:
+                return threshold, "fpr_constrained"
+        else:
+            raise ValueError(f"Unknown threshold_policy: {threshold_policy}")
+
+    # Preserve the original normal-only behavior.
+    if has_normal:
+        threshold = _quantile_threshold_from_negatives(y_true, y_score, target_fpr)
+        if threshold is not None:
+            return threshold, "quantile"
+
     return None, "none"
 
 
@@ -251,6 +373,9 @@ def _build_run_name(args):
         run_name += f"_model-{Path(args.model_ckpt).name}"
     run_name += f"_pca_ev{args.pca_ev}" if args.pca_ev is not None else f"_pca_dim{args.pca_dim}"
     run_name += f"_i-score{args.img_score_agg}"
+    run_name += f"_thr-{args.threshold_policy}"
+    if args.threshold_policy == "fpr_constrained":
+        run_name += f"-fpr{args.target_img_fpr:g}"
     if args.use_d1_denoise:
         run_name += (
             f"_D1-s{args.d1_sigma:g}"
@@ -812,12 +937,15 @@ def main():
         val_paths_all = handler.get_validation_paths()
         test_paths_all = handler.get_test_paths()
 
+        val_labels_all = [handler.get_image_label(p) for p in val_paths_all]
         test_labels_all = [handler.get_image_label(p) for p in test_paths_all]
         dataset_counts.append(
             {
                 "category": category,
                 "train_good_count": len(train_paths_all),
-                "val_good_count": sum(handler.get_image_label(p) == 0 for p in val_paths_all),
+                "val_good_count": sum(label == 0 for label in val_labels_all),
+                "val_bad_count": sum(label == 1 for label in val_labels_all),
+                "val_total_count": len(val_paths_all),
                 "test_good_count": sum(label == 0 for label in test_labels_all),
                 "test_bad_count": sum(label == 1 for label in test_labels_all),
                 "test_total_count": len(test_paths_all),
@@ -909,10 +1037,11 @@ def main():
         actual_pca_dim = _get_pca_dim(pca_params)
         logging.info("Actual fitted PCA dimension for %s: %s", category, actual_pca_dim)
 
-        # Validation threshold. Your wafer validation set is normal-only, so this
-        # normally uses the negative quantile fallback controlled by target_img_fpr.
-        # Raw validation scores are also saved so score distributions can be
-        # analyzed later without re-running DINOv2/PCA inference.
+        # Validation threshold. Mixed normal+anomaly validation can use either
+        # Best-F1 or FPR-constrained selection. Normal-only validation preserves
+        # the original negative-quantile fallback controlled by target_img_fpr.
+        # Raw validation scores are saved so score distributions can be analyzed
+        # later without re-running DINOv2/PCA inference.
         thr_img = None
         if val_paths:
             val_scores, val_labels, val_score_paths = [], [], []
@@ -936,7 +1065,10 @@ def main():
                     val_labels.append(handler.get_image_label(path))
 
             thr_img, how_img = _pick_threshold_with_fallback(
-                val_labels, val_scores, args.target_img_fpr
+                val_labels,
+                val_scores,
+                args.target_img_fpr,
+                args.threshold_policy,
             )
             logging.info(
                 "Chosen image threshold for %s: %s (%s)",
@@ -944,6 +1076,42 @@ def main():
                 f"{thr_img:.8f}" if thr_img is not None else "N/A",
                 how_img,
             )
+            if thr_img is not None:
+                val_stats = _classification_stats_from_scores(
+                    val_labels, val_scores, thr_img
+                )
+                logging.info(
+                    "%s validation operating point | policy=%s | target_FPR=%.6f | "
+                    "FPR=%s | Recall=%s | Precision=%s | F1=%s | "
+                    "TP=%d TN=%d FP=%d FN=%d",
+                    category,
+                    how_img,
+                    args.target_img_fpr,
+                    (
+                        f"{val_stats['fpr']:.6f}"
+                        if np.isfinite(val_stats.get("fpr", np.nan))
+                        else "N/A"
+                    ),
+                    (
+                        f"{val_stats['recall']:.6f}"
+                        if np.isfinite(val_stats.get("recall", np.nan))
+                        else "N/A"
+                    ),
+                    (
+                        f"{val_stats['precision']:.6f}"
+                        if np.isfinite(val_stats.get("precision", np.nan))
+                        else "N/A"
+                    ),
+                    (
+                        f"{val_stats['f1']:.6f}"
+                        if np.isfinite(val_stats.get("f1", np.nan))
+                        else "N/A"
+                    ),
+                    int(val_stats.get("tp", 0)),
+                    int(val_stats.get("tn", 0)),
+                    int(val_stats.get("fp", 0)),
+                    int(val_stats.get("fn", 0)),
+                )
 
             for path, gt_label, val_score in zip(
                 val_score_paths, val_labels, val_scores
