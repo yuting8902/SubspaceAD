@@ -1,14 +1,36 @@
-import glob
 import os
 from pathlib import Path
+
 import numpy as np
 from PIL import Image
-import pandas as pd
-import logging
+
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+_IGNORED_DIR_NAMES = {".ipynb_checkpoints"}
+_NORMAL_FOLDER_NAMES = {"good", "normal"}
+
+
+def _is_ignored_path(path: Path) -> bool:
+    """Return True when any path component should be ignored."""
+    return any(part in _IGNORED_DIR_NAMES for part in path.parts)
+
+
+def _list_images(folder: Path, recursive: bool = False):
+    """Return image files with common extensions, ignoring notebook checkpoints."""
+    if not folder.exists():
+        return []
+    iterator = folder.rglob("*") if recursive else folder.glob("*")
+    return sorted(
+        str(p)
+        for p in iterator
+        if p.is_file()
+        and p.suffix.lower() in _IMAGE_EXTENSIONS
+        and not _is_ignored_path(p)
+    )
 
 
 class BaseDatasetHandler:
-    """Abstract base class for dataset handlers."""
+    """Common interface expected by SubspaceAD main.py."""
 
     def __init__(self, root_path, category):
         self.root_path = Path(root_path)
@@ -19,7 +41,7 @@ class BaseDatasetHandler:
         raise NotImplementedError
 
     def get_validation_paths(self):
-        return []  # Default: no validation set
+        return []
 
     def get_test_paths(self):
         raise NotImplementedError
@@ -28,26 +50,29 @@ class BaseDatasetHandler:
         raise NotImplementedError
 
     def get_ground_truth_mask(self, test_path: str, res: tuple):
-        gt_path_str = self.get_ground_truth_path(test_path)
-        if not gt_path_str or not os.path.exists(gt_path_str):
+        gt_path = self.get_ground_truth_path(test_path)
+        if not gt_path or not os.path.exists(gt_path):
             return np.zeros((res[1], res[0]), dtype=np.uint8)
 
-        mask = (
-            Image.open(gt_path_str)
-            .convert("L")
-            .resize(res, Image.Resampling.NEAREST)  # res is (W, H)
-        )
-        return (np.array(mask) > 0).astype(np.uint8)  # returns (H, W) array
+        mask = Image.open(gt_path).convert("L").resize(res, Image.Resampling.NEAREST)
+        return (np.asarray(mask) > 0).astype(np.uint8)
+
+    def get_defect_type(self, image_path: str) -> str:
+        """Use the immediate parent folder as the defect type."""
+        return Path(image_path).parent.name
+
+    def get_image_label(self, image_path: str) -> int:
+        """0=normal, 1=anomaly using the test subfolder name."""
+        defect_type = self.get_defect_type(image_path).lower()
+        return 0 if defect_type in _NORMAL_FOLDER_NAMES else 1
 
 
 class MVTecADDataset(BaseDatasetHandler):
-    """Handler for the original MVTec AD dataset structure."""
-
     def get_train_paths(self):
-        return sorted(glob.glob(str(self.category_path / "train" / "good" / "*.png")))
+        return _list_images(self.category_path / "train" / "good")
 
     def get_test_paths(self):
-        return sorted(glob.glob(str(self.category_path / "test" / "*" / "*.png")))
+        return _list_images(self.category_path / "test", recursive=True)
 
     def get_ground_truth_path(self, test_path: str):
         p = Path(test_path)
@@ -57,68 +82,41 @@ class MVTecADDataset(BaseDatasetHandler):
 
 
 class MVTecLOCODataset(BaseDatasetHandler):
-    """
-    Handler for MVTec LOCO AD.
-    Structure:
-        train/good
-        validation/good
-        test/good, test/logical_anomalies, test/structural_anomalies
-        ground_truth/logical_anomalies/000/000.png (nested) OR standard _mask.png
-    """
-
     def get_train_paths(self):
-        return sorted(glob.glob(str(self.category_path / "train" / "good" / "*.png")))
+        return _list_images(self.category_path / "train" / "good")
 
     def get_validation_paths(self):
-        return sorted(
-            glob.glob(str(self.category_path / "validation" / "good" / "*.png"))
-        )
+        return _list_images(self.category_path / "validation" / "good")
 
     def get_test_paths(self):
-        return sorted(
-            glob.glob(str(self.category_path / "test" / "**" / "*.png"), recursive=True)
-        )
+        return _list_images(self.category_path / "test", recursive=True)
 
     def get_ground_truth_path(self, test_path: str):
         p = Path(test_path)
-        anomaly_type = p.parent.name  # e.g., 'logical_anomalies'
-
-        if anomaly_type == "good":
+        anomaly_type = p.parent.name
+        if anomaly_type.lower() == "good":
             return None
-        candidate_1 = (
-            self.category_path / "ground_truth" / anomaly_type / f"{p.stem}_mask.png"
-        )
-        if candidate_1.exists():
-            return str(candidate_1)
-        candidate_2 = (
-            self.category_path / "ground_truth" / anomaly_type / p.stem / "000.png"
-        )
-        if candidate_2.exists():
-            return str(candidate_2)
-        candidate_3 = (
-            self.category_path / "ground_truth" / anomaly_type / p.stem / f"{p.name}"
-        )
-        if candidate_3.exists():
-            return str(candidate_3)
 
+        candidates = [
+            self.category_path / "ground_truth" / anomaly_type / f"{p.stem}_mask.png",
+            self.category_path / "ground_truth" / anomaly_type / p.stem / "000.png",
+            self.category_path / "ground_truth" / anomaly_type / p.stem / p.name,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
         return None
 
 
 class MVTecAD2Dataset(BaseDatasetHandler):
-    """Handler for the MVTec AD 2 dataset structure."""
-
     def get_train_paths(self):
-        return sorted(glob.glob(str(self.category_path / "train" / "good" / "*.png")))
+        return _list_images(self.category_path / "train" / "good")
 
     def get_validation_paths(self):
-        return sorted(
-            glob.glob(str(self.category_path / "validation" / "good" / "*.png"))
-        )
+        return _list_images(self.category_path / "validation" / "good")
 
     def get_test_paths(self):
-        return sorted(
-            glob.glob(str(self.category_path / "test_public" / "*" / "*.png"))
-        )
+        return _list_images(self.category_path / "test_public", recursive=True)
 
     def get_ground_truth_path(self, test_path: str):
         p = Path(test_path)
@@ -132,40 +130,77 @@ class MVTecAD2Dataset(BaseDatasetHandler):
 
 
 class VisADataset(BaseDatasetHandler):
-    """Handler for VisA dataset with structure:
-    category/
-    ├── ground_truth/bad/*.png
-    ├── test/{good,bad}/*.JPG
-    └── train/good/*.JPG
-    """
-
     def get_train_paths(self):
-        return sorted(glob.glob(str(self.category_path / "train" / "good" / "*.JPG")))
+        return _list_images(self.category_path / "train" / "good")
 
     def get_test_paths(self):
-        # include both good and bad
-        return sorted(glob.glob(str(self.category_path / "test" / "*" / "*.JPG")))
+        return _list_images(self.category_path / "test", recursive=True)
 
     def get_ground_truth_path(self, test_path: str):
         p = Path(test_path)
-        # only bad samples have masks
-        if "bad" in p.parts:
-            mask_path = self.category_path / "ground_truth" / "bad" / f"{p.stem}.png"
-            if mask_path.exists():
-                return str(mask_path)
-        # good samples have no ground truth
+        if p.parent.name.lower() != "bad":
+            return None
+        candidate = self.category_path / "ground_truth" / "bad" / f"{p.stem}.png"
+        return str(candidate) if candidate.exists() else None
+
+
+class WaferDataset(BaseDatasetHandler):
+    """
+    Custom wafer dataset with independent roots for train / validation / test.
+
+    Expected structure:
+        train_root/<category>/train/good/*
+        val_root/<category>/val/good/*
+        test_root/<category>/test/good/*
+        test_root/<category>/test/<anomaly_type>/*
+
+    Any '.ipynb_checkpoints' directory is ignored recursively.
+    Ground-truth segmentation masks are intentionally not required.
+    """
+
+    def __init__(self, root_path, category):
+        # root_path is train_root because config.py maps args.dataset_path to it.
+        super().__init__(root_path, category)
+
+        train_root = os.environ.get("SUBSPACEAD_WAFER_TRAIN_ROOT", str(root_path))
+        val_root = os.environ.get("SUBSPACEAD_WAFER_VAL_ROOT")
+        test_root = os.environ.get("SUBSPACEAD_WAFER_TEST_ROOT")
+
+        if not test_root:
+            raise ValueError(
+                "Wafer test root is missing. Run with --dataset_name wafer "
+                "--train_root ... --test_root ..."
+            )
+
+        self.train_category_path = Path(train_root) / category
+        self.val_category_path = Path(val_root) / category if val_root else None
+        self.test_category_path = Path(test_root) / category
+
+    def get_train_paths(self):
+        return _list_images(self.train_category_path / "train" / "good")
+
+    def get_validation_paths(self):
+        if self.val_category_path is None:
+            return []
+        return _list_images(self.val_category_path / "val" / "good")
+
+    def get_test_paths(self):
+        # Supports normal-only, anomaly-only, or mixed test sets.
+        return _list_images(self.test_category_path / "test", recursive=True)
+
+    def get_ground_truth_path(self, test_path: str):
         return None
 
 
 def get_dataset_handler(name: str, root_path: str, category: str) -> BaseDatasetHandler:
-    """Factory function to get the correct dataset handler."""
-    if name == "mvtec_ad":
-        return MVTecADDataset(root_path, category)
-    elif name == "mvtec_loco":
-        return MVTecLOCODataset(root_path, category)
-    elif name == "mvtec_ad2":
-        return MVTecAD2Dataset(root_path, category)
-    elif name == "visa":
-        return VisADataset(root_path, category)
-    else:
-        raise ValueError(f"Unknown dataset: {name}")
+    handlers = {
+        "mvtec_ad": MVTecADDataset,
+        "mvtec_loco": MVTecLOCODataset,
+        "mvtec_ad2": MVTecAD2Dataset,
+        "visa": VisADataset,
+        "wafer": WaferDataset,
+    }
+    try:
+        return handlers[name](root_path, category)
+    except KeyError as exc:
+        raise ValueError(f"Unknown dataset: {name}") from exc

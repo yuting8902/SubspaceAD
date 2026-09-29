@@ -1,0 +1,43 @@
+## Wafer
+python main.py \
+    --dataset_name wafer \
+    --train_root /workspace/data/develop \
+    --val_root /workspace/data/develop \
+    --test_root /workspace/data/develop \
+    --feature_source anomalyvfm \
+    --anomalyvfm_ckpt /workspace/Venessa/AnomalyVFM_/pretrained_models/anomalyvfm_dinov2.pkl \
+    --anomalyvfm_variant a1_adapted_final \
+    --image_res 672 \
+    --k_shot 4 \
+    --aug_count 30 \
+    --aug_list rotation \
+    --aud_method mean \
+    --pca_ev 0.99 \
+    --score_method reconstruction \
+    --img_score_agg mtop1p \
+    --target_img_fpr 0.01 \
+    --batch_size 1 \
+    --save_intro_overlays \
+    --seed 42 \
+    --outdir ./fewshot_results/wafer \
+    --fixed_heatmap_scale \
+    --fixed_heatmap_vmin 0 \
+    --fixed_heatmap_vmax 50 \
+    --use_d1_denoise \
+    --use_d2_denoise
+
+
+## MVTec
+python main.py \
+    --dataset_name mvtec_ad \
+    --dataset_path /home/venessa/workspace/data/wo_patch/mvtec \
+    --categories bottle \
+    --feature_source anomalyvfm \
+    --anomalyvfm_variant a1_adapted_final \
+    --anomalyvfm_root /home/venessa/workspace/AnomalyVFM_ \
+    --anomalyvfm_ckpt /home/venessa/workspace/AnomalyVFM_/pretrained_models/anomalyvfm_dinov2.pkl \
+    --dino_repo_path /home/venessa/workspace/dinov2 \
+    --dino_weight_path /home/venessa/workspace/model_weight/dinov2_vitl14_reg4_pretrain.pth \
+    --image_res 672 \
+    --k_shot 4 \
+    --outdir ./results/mvtec

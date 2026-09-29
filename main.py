@@ -1,57 +1,96 @@
-import os
-import math
 import logging
+import math
+import os
+import random
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
-import random
 import pandas as pd
 import torch
 import torchvision.transforms.functional as TF
-from scipy.ndimage import label as cc_label, generate_binary_structure
 from PIL import Image
-from tqdm import tqdm
-import cv2
-from sklearn.metrics import (
-    roc_auc_score,
-    f1_score,
-    precision_recall_curve,
-    average_precision_score,
-)
 from sklearn.decomposition import PCA
+from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, roc_auc_score
+from tqdm import tqdm
 
-from src.subspacead.config import get_args, parse_layer_indices, parse_grouped_layers
-from src.subspacead.utils.common import (
-    setup_logging,
-    save_config,
-    min_max_norm,
-)
-from src.subspacead.data.datasets import get_dataset_handler
+from src.subspacead.config import get_args, parse_grouped_layers, parse_layer_indices
 from src.subspacead.core.extractor import FeatureExtractor
-from src.subspacead.core.pca import PCAModel, KernelPCAModel
-from src.subspacead.post_process.scoring import (
-    calculate_anomaly_scores,
-    post_process_map,
-)
-from src.subspacead.utils.viz import save_visualization, save_overlay_for_intro
-from src.subspacead.post_process.specular import (
-    specular_mask_torch,
-    filter_specular_anomalies,
-)
-from src.subspacead.core.patching import process_image_patched, get_patch_coords
+from src.subspacead.core.anomalyvfm_extractor import AnomalyVFMFeatureExtractor
+from src.subspacead.core.patching import get_patch_coords, process_image_patched
+from src.subspacead.core.pca import KernelPCAModel, PCAModel
+from src.subspacead.data.datasets import get_dataset_handler
 from src.subspacead.data.transforms import get_augmentation_transform
+from src.subspacead.post_process.scoring import calculate_anomaly_scores, post_process_map
+from src.subspacead.post_process.denoise import (
+    local_contrast_denoise,
+    spatial_coherence_suppress,
+)
+from src.subspacead.post_process.specular import filter_specular_anomalies, specular_mask_torch
+from src.subspacead.utils.common import min_max_norm, save_config, setup_logging
+from src.subspacead.utils.viz import save_overlay_for_intro, save_visualization
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 print(f"Using device: {DEVICE}")
 
 
+CATEGORY_RESULT_COLUMNS = [
+    "category",
+    "pca_dim",
+    "threshold",
+    "TP",
+    "TN",
+    "FP",
+    "FN",
+    "fpr",
+    "fnr",
+    "Image_AUROC",
+    "Image_AUPR",
+    "Image_F1",
+    "Avg_Inference_time",
+]
+
+DATASET_COUNT_COLUMNS = [
+    "category",
+    "train_good_count",
+    "val_good_count",
+    "test_good_count",
+    "test_bad_count",
+    "test_total_count",
+]
+
+IMAGE_RESULT_COLUMNS = [
+    "category",
+    "image_path",
+    "defect_type",
+    "gt_label",
+    "pred_label",
+    "result_type",
+    "anomaly_score",
+    "threshold",
+    "inference_time",
+    "heatmap_path",
+]
+
+VALIDATION_RESULT_COLUMNS = [
+    "category",
+    "image_path",
+    "pca_dim",
+    "gt_label",
+    "anomaly_score",
+    "threshold",
+    "pred_label",
+    "result_type",
+]
+
+
 def _best_f1_threshold_from_scores(y_true, y_score):
-    """Return threshold maximizing F1 on validation scores."""
+    """Return threshold maximizing positive-class F1 on validation scores."""
     y_true = np.asarray(y_true).astype(np.uint8)
     y_score = np.asarray(y_score, dtype=np.float64)
-    if y_true.size == 0 or y_score.size == 0 or (y_true.max() == y_true.min()):
+    if y_true.size == 0 or y_score.size == 0 or y_true.max() == y_true.min():
         return None, 0.0
     p, r, t = precision_recall_curve(y_true, y_score)
     if t.size == 0:
@@ -61,25 +100,22 @@ def _best_f1_threshold_from_scores(y_true, y_score):
     return float(t[i]), float(f1[i])
 
 
-def _quantile_threshold_from_negatives(y_true, y_score, target_fpr=0.01):
-    """
-    Fallback: pick threshold so that ~target_fpr of NEGATIVES exceed it.
-    y_true in {0,1}, negatives are 0. Returns None if no negatives.
-    """
+def _quantile_threshold_from_negatives(y_true, y_score, target_fpr=0.05):
+    """For normal-only validation, use the (1-target_fpr) normal-score quantile."""
     y_true = np.asarray(y_true).astype(np.uint8)
     y_score = np.asarray(y_score, dtype=np.float64)
     neg = y_score[y_true == 0]
     if neg.size == 0:
         return None
     q = np.clip(1.0 - float(target_fpr), 0.0, 1.0)
-    return float(np.quantile(neg, q, interpolation="linear"))
+    # method= is supported by modern NumPy; interpolation= keeps compatibility with older versions.
+    try:
+        return float(np.quantile(neg, q, method="linear"))
+    except TypeError:
+        return float(np.quantile(neg, q, interpolation="linear"))
 
 
 def _pick_threshold_with_fallback(y_true, y_score, target_fpr):
-    """
-    Try PR-optimal F1; if degenerate (single-class), fall back to negative-quantile.
-    Returns (thr, how), where how ∈ {"pr", "quantile", "none"}.
-    """
     thr_pr, _ = _best_f1_threshold_from_scores(y_true, y_score)
     if thr_pr is not None:
         return thr_pr, "pr"
@@ -89,121 +125,108 @@ def _pick_threshold_with_fallback(y_true, y_score, target_fpr):
     return None, "none"
 
 
-def topk_mean(arr, frac=0.01):
-    flat = arr.ravel()
+def _topk_mean(arr, frac=0.01):
+    flat = np.asarray(arr).ravel()
     k = max(1, int(len(flat) * frac))
     idx = np.argpartition(flat, -k)[-k:]
     return float(np.mean(flat[idx]))
 
 
-def compute_aupro(
-    anomaly_maps,
-    gt_masks,
-    fpr_limit: float = 0.3,
-    num_thresholds: int = 300,
-    connectivity: int = 8,
-):
+def _aggregate_image_score(anomaly_map: np.ndarray, method: str) -> float:
+    if method == "max":
+        return float(np.max(anomaly_map))
+    if method == "p99":
+        return float(np.percentile(anomaly_map, 99))
+    if method == "mtop5":
+        return float(np.mean(np.sort(anomaly_map.flatten())[-5:]))
+    if method == "mtop1p":
+        return _topk_mean(anomaly_map, frac=0.01)
+    return float(np.mean(anomaly_map))
+
+
+def _safe_ratio(num, den):
+    return float(num / den) if den > 0 else np.nan
+
+
+def _nanmean_or_nan(values):
+    arr = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(arr)
+    return float(np.mean(arr[finite])) if finite.any() else np.nan
+
+
+def _normalize_anomaly_map_for_viz(anomaly_map: np.ndarray, args) -> np.ndarray:
     """
-    MVTec-AD AUPRO (Bergmann et al.).
+    Visualization-only normalization.
 
-    Args:
-        anomaly_maps: list/array of [H, W] float prediction maps. Higher = more anomalous.
-        gt_masks:     list/array of [H, W] binary masks (uint8/bool). 1 = anomaly.
-        fpr_limit:    integration upper bound on Set FPR. MVTec convention: 0.3.
-        num_thresholds: number of FPR-linspaced thresholds inside [0, fpr_limit].
-        connectivity: 4 or 8 for connected components.
+    Default behavior is unchanged: per-image min-max normalization.
 
-    Returns:
-        AUPRO in [0, 1] (perfect detector = 1.0). NaN if undefined.
+    With --fixed_heatmap_scale, every image uses the same raw anomaly-score
+    interval [fixed_heatmap_vmin, fixed_heatmap_vmax]. Values below vmin are
+    clipped to 0 and values above vmax are clipped to 1.
+
+    This function affects saved heatmaps only. It does not modify image scores,
+    thresholds, predictions, CSV outputs, D1, D2, PCA, or the anomaly map used
+    for evaluation.
     """
-    preds = np.stack([np.asarray(p, dtype=np.float32) for p in anomaly_maps])
-    gts = np.stack([np.asarray(g, dtype=np.uint8) for g in gt_masks])
-    assert preds.shape == gts.shape, f"shape mismatch: {preds.shape} vs {gts.shape}"
+    if not args.fixed_heatmap_scale:
+        return min_max_norm(anomaly_map)
 
-    if not np.isfinite(preds).all():
-        return float("nan")
-
-    # 1. Connected components -> per-region (img_idx, sorted_scores_inside_region).
-    structure = generate_binary_structure(2, 2 if connectivity == 8 else 1)
-    region_sorted_scores = []  # list of 1D arrays, one per region
-    for i in range(gts.shape[0]):
-        if gts[i].sum() == 0:
-            continue
-        labeled, n = cc_label(gts[i], structure=structure)
-        for r in range(1, n + 1):
-            region_mask = labeled == r
-            region_scores = preds[i][region_mask]
-            region_sorted_scores.append(np.sort(region_scores))  # ascending
-
-    if len(region_sorted_scores) == 0:
-        return float("nan")
-
-    neg_scores = preds[gts == 0]
-    if neg_scores.size == 0:
-        return float("nan")
-    neg_sorted = np.sort(neg_scores)  # ascending
-    n_neg = neg_sorted.size
-
-    # 3. Pick thresholds that are linear in FPR over [0, fpr_limit].
-    target_fprs = np.linspace(0.0, fpr_limit, num_thresholds + 1)[1:]  # exclude 0
-    # quantile(1 - f): use sorted neg array directly for stability
-    q_idx = np.clip(
-        np.floor((1.0 - target_fprs) * (n_neg - 1)).astype(np.int64), 0, n_neg - 1
-    )
-    thresholds = neg_sorted[q_idx]  # shape: [num_thresholds]
-
-    # 4. For each threshold, compute realized FPR and mean PRO.
-    fp_counts = n_neg - np.searchsorted(neg_sorted, thresholds, side="left")
-    fprs = fp_counts.astype(np.float64) / n_neg
-
-    # Mean PRO across regions, vectorized via searchsorted on each region's sorted scores.
-    pros_accum = np.zeros(num_thresholds, dtype=np.float64)
-    for region_scores in region_sorted_scores:
-        rs = region_scores
-        area = rs.size
-        # for each t: overlap = (rs >= t).sum() / area
-        ge_counts = rs.size - np.searchsorted(rs, thresholds, side="left")
-        pros_accum += ge_counts / area
-    pros = pros_accum / len(region_sorted_scores)
-
-    # 5. Sort by FPR (should already be ascending up to ties), prepend (0, 0) anchor.
-    order = np.argsort(fprs, kind="stable")
-    fprs_s = np.concatenate([[0.0], fprs[order]])
-    pros_s = np.concatenate([[0.0], pros[order]])
-
-    # 6. Clip strictly to [0, fpr_limit] with linear interpolation at the boundary.
-    if fprs_s[-1] > fpr_limit:
-        cut = np.searchsorted(fprs_s, fpr_limit, side="right")
-        # linear interp between fprs_s[cut-1] and fprs_s[cut] at x=fpr_limit
-        f0, f1 = fprs_s[cut - 1], fprs_s[cut]
-        p0, p1 = pros_s[cut - 1], pros_s[cut]
-        p_at = p0 + (p1 - p0) * (fpr_limit - f0) / (f1 - f0) if f1 > f0 else p0
-        fprs_s = np.concatenate([fprs_s[:cut], [fpr_limit]])
-        pros_s = np.concatenate([pros_s[:cut], [p_at]])
-    elif fprs_s[-1] < fpr_limit:
-        # didn't reach fpr_limit (rare): extrapolate flat from last point
-        fprs_s = np.concatenate([fprs_s, [fpr_limit]])
-        pros_s = np.concatenate([pros_s, [pros_s[-1]]])
-
-    aupro = np.trapz(pros_s, fprs_s) / fpr_limit
-    return float(aupro)
+    vmin = float(args.fixed_heatmap_vmin)
+    vmax = float(args.fixed_heatmap_vmax)
+    normalized = (np.asarray(anomaly_map, dtype=np.float32) - vmin) / (vmax - vmin)
+    return np.clip(normalized, 0.0, 1.0)
 
 
-def main():
-    args = get_args()
-    run_name = f"{args.dataset_name}_{args.agg_method}_layers{''.join(args.layers.split(','))}_res{args.image_res}_docrop{int(args.docrop)}"
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        random.seed(args.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(args.seed)
-            torch.cuda.manual_seed_all(args.seed)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
+def _result_type(gt_label: int, pred_label: int) -> str:
+    if gt_label == 1 and pred_label == 1:
+        return "TP"
+    if gt_label == 0 and pred_label == 0:
+        return "TN"
+    if gt_label == 0 and pred_label == 1:
+        return "FP"
+    return "FN"
+
+
+def _get_pca_dim(pca_params: dict) -> float:
+    """Return the actual fitted PCA subspace dimensionality."""
+    k = pca_params.get("k")
+    if k is not None:
+        return int(k)
+    if "components" in pca_params:
+        return int(np.asarray(pca_params["components"]).shape[1])
+    kpca = pca_params.get("kpca")
+    if kpca is not None:
+        for attr in ("eigenvalues_", "lambdas_"):
+            values = getattr(kpca, attr, None)
+            if values is not None:
+                return int(len(values))
+    return np.nan
+
+
+def _build_run_name(args):
+    if args.feature_source == "anomalyvfm":
+        variant_labels = {
+            "a0_original_final": "A0-original-final",
+            "a1_adapted_final": "A1-adapted-final",
+            "a2_adapted_middle": "A2-adapted-middle",
+        }
+        variant_label = variant_labels[args.anomalyvfm_variant]
+        if args.anomalyvfm_variant == "a2_adapted_middle":
+            run_name = (
+                f"{args.dataset_name}_{variant_label}"
+                f"_mean_layers{''.join(args.layers.split(','))}"
+                f"_res{args.image_res}_docrop{int(args.docrop)}"
+            )
+        else:
+            run_name = (
+                f"{args.dataset_name}_{variant_label}"
+                f"_res{args.image_res}_docrop{int(args.docrop)}"
+            )
     else:
-        print("No seed specified; aborting for reproducibility.")
-        return
+        run_name = (
+            f"{args.dataset_name}_{args.agg_method}_layers{''.join(args.layers.split(','))}"
+            f"_res{args.image_res}_docrop{int(args.docrop)}"
+        )
     if args.patch_size:
         run_name += f"_patch{args.patch_size}"
     if args.use_kernel_pca:
@@ -219,363 +242,657 @@ def main():
     run_name += f"_score-{args.score_method}"
     run_name += f"_clahe{int(args.use_clahe)}"
     run_name += f"_dropk{args.drop_k}"
-    run_name += f"_model-{args.model_ckpt.split('/')[-1]}"
-    run_name += (
-        f"pca_ev{args.pca_ev}" if args.pca_ev is not None else f"_pca_dim{args.pca_dim}"
-    )
+    if args.feature_source == "anomalyvfm":
+        if args.anomalyvfm_variant == "a0_original_final":
+            run_name += f"_model-{Path(args.dino_weight_path).stem}"
+        else:
+            run_name += f"_model-{Path(args.anomalyvfm_ckpt).stem}"
+    else:
+        run_name += f"_model-{Path(args.model_ckpt).name}"
+    run_name += f"_pca_ev{args.pca_ev}" if args.pca_ev is not None else f"_pca_dim{args.pca_dim}"
     run_name += f"_i-score{args.img_score_agg}"
-
-    # Add k-shot and augmentation info to run name
+    if args.use_d1_denoise:
+        run_name += (
+            f"_D1-s{args.d1_sigma:g}"
+            f"-a{args.d1_alpha:g}"
+            f"-l{args.d1_lambda:g}"
+        )
+    if args.use_d2_denoise:
+        run_name += (
+            f"_D2-p{args.d2_percentile:g}"
+            f"-g{args.d2_grid_size}"
+            f"-l{args.d2_lambda:g}"
+            f"-w{args.d2_min_weight:g}"
+        )
+    if args.fixed_heatmap_scale:
+        run_name += (
+            f"_vis-fixed-{args.fixed_heatmap_vmin:g}"
+            f"-{args.fixed_heatmap_vmax:g}"
+        )
     if args.k_shot is not None:
         run_name += f"_k{args.k_shot}"
         if args.aug_count > 0 and args.aug_list:
-            # Create a short string for augs, e.g., "hrc"
             aug_str = "".join(sorted([a[0] for a in args.aug_list]))
             run_name += f"_aug{args.aug_count}x{aug_str}"
-
     run_name += f"_seed{args.seed}"
+    return run_name
 
-    args.outdir = os.path.join(args.outdir, run_name)
+
+def _build_feature_extractor(args):
+    """Build H0 or Meta/AnomalyVFM extractor; downstream SubspaceAD stays unchanged."""
+    if args.feature_source == "dinov2":
+        return FeatureExtractor(args.model_ckpt)
+
+    if args.feature_source != "anomalyvfm":
+        raise ValueError(f"Unknown feature_source: {args.feature_source}")
+
+    if args.image_res != 672:
+        raise ValueError(
+            "Meta/AnomalyVFM DINOv2 variants require --image_res 672."
+        )
+
+    if args.docrop:
+        raise ValueError(
+            "Meta/AnomalyVFM DINOv2 variants do not support --docrop because "
+            "they use the native direct Resize(672,672) preprocessing."
+        )
+
+    if args.bg_mask_method == "dino_saliency":
+        raise ValueError(
+            "Meta/AnomalyVFM variants do not implement SubspaceAD "
+            "DINO-attention saliency. Use --bg_mask_method pca_normality "
+            "or omit --bg_mask_method."
+        )
+
+    if args.patch_size and args.bg_mask_method is not None:
+        raise ValueError(
+            "Meta/AnomalyVFM patching mode currently requires "
+            "--bg_mask_method to be omitted. Official SubspaceAD patching "
+            "routes enabled masking through DINO saliency, which this "
+            "extractor intentionally does not implement."
+        )
+
+    if (
+        args.anomalyvfm_variant == "a2_adapted_middle"
+        and args.agg_method != "mean"
+    ):
+        raise ValueError(
+            "A2 is defined as adapted middle layers with mean aggregation. "
+            "Please use --agg_method mean."
+        )
+
+    logging.info(
+        "Meta/AnomalyVFM variant selected: %s",
+        args.anomalyvfm_variant,
+    )
+
+    if args.anomalyvfm_variant == "a0_original_final":
+        logging.info(
+            "A0: original Meta DINOv2 final normalized patch tokens; "
+            "no DoRA / AnomalyVFM checkpoint."
+        )
+    elif args.anomalyvfm_variant == "a1_adapted_final":
+        logging.info(
+            "A1/H1: AnomalyVFM DoRA-adapted final x_norm_patchtokens."
+        )
+    elif args.anomalyvfm_variant == "a2_adapted_middle":
+        logging.info(
+            "A2: AnomalyVFM DoRA-adapted middle layers=%s, "
+            "per-layer norm=True, mean aggregation.",
+            args.layers,
+        )
+
+    return AnomalyVFMFeatureExtractor(
+        anomalyvfm_root=args.anomalyvfm_root,
+        anomalyvfm_ckpt=args.anomalyvfm_ckpt,
+        dino_repo_path=args.dino_repo_path,
+        dino_weight_path=args.dino_weight_path,
+        variant=args.anomalyvfm_variant,
+    )
+
+
+def _apply_dino_train_mask(tokens_flat, saliency_masks_batch, args):
+    """Keep the official DINO-saliency training mask behavior."""
+    masks_flat = saliency_masks_batch.reshape(-1)
+    try:
+        if args.mask_threshold_method == "percentile":
+            threshold = np.percentile(masks_flat, args.percentile_threshold * 100)
+            foreground_tokens = tokens_flat[masks_flat >= threshold]
+        else:
+            norm_mask = cv2.normalize(
+                masks_flat, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
+            )
+            _, binary_mask = cv2.threshold(
+                norm_mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            foreground_tokens = tokens_flat[binary_mask.flatten() > 0]
+        if foreground_tokens.shape[0] > 0:
+            return foreground_tokens
+        logging.warning("No foreground tokens found. Using all tokens.")
+    except Exception as exc:
+        logging.warning("Training mask failed: %s. Using all tokens.", exc)
+    return tokens_flat
+
+
+def _prepare_pca_training(
+    train_paths,
+    extractor,
+    args,
+    layers,
+    grouped_layers,
+    aug_transform,
+):
+    """Build the official-style streaming feature generator and metadata."""
+    if args.patch_size:
+        if args.bg_mask_method == "pca_normality":
+            raise ValueError("Cannot use pca_normality mask with --patch_size.")
+
+        temp_img = Image.open(train_paths[0]).convert("RGB")
+        temp_patch = temp_img.crop((0, 0, args.patch_size, args.patch_size))
+        temp_tokens, (h_p, w_p), _ = extractor.extract_tokens(
+            [temp_patch],
+            args.image_res,
+            layers,
+            args.agg_method,
+            grouped_layers,
+            args.docrop,
+            use_clahe=args.use_clahe,
+            dino_saliency_layer=args.dino_saliency_layer,
+        )
+        feature_dim = temp_tokens.shape[-1]
+        tokens_per_patch = h_p * w_p
+        aug_mult = (1 + args.aug_count) if aug_transform else 1
+        total_patches = 0
+        num_batches = 0
+        for path in train_paths:
+            img = Image.open(path).convert("RGB")
+            coords = get_patch_coords(
+                img.height, img.width, args.patch_size, args.patch_overlap
+            )
+            total_patches += len(coords) * aug_mult
+            num_batches += math.ceil(len(coords) / args.batch_size) * aug_mult
+        total_tokens = total_patches * tokens_per_patch
+
+        def feature_generator():
+            for path in train_paths:
+                pil_img = Image.open(path).convert("RGB")
+                images = [pil_img]
+                if aug_transform:
+                    images.extend(aug_transform(pil_img) for _ in range(args.aug_count))
+                for img in images:
+                    coords = get_patch_coords(
+                        img.height, img.width, args.patch_size, args.patch_overlap
+                    )
+                    for i in range(0, len(coords), args.batch_size):
+                        patch_batch = [img.crop(c) for c in coords[i : i + args.batch_size]]
+                        tokens_batch, _, saliency = extractor.extract_tokens(
+                            patch_batch,
+                            args.image_res,
+                            layers,
+                            args.agg_method,
+                            grouped_layers,
+                            args.docrop,
+                            use_clahe=args.use_clahe,
+                            dino_saliency_layer=args.dino_saliency_layer,
+                        )
+                        tokens_flat = tokens_batch.reshape(-1, feature_dim)
+                        if args.bg_mask_method == "dino_saliency":
+                            tokens_flat = _apply_dino_train_mask(tokens_flat, saliency, args)
+                        yield tokens_flat
+
+        return feature_generator, feature_dim, total_tokens, num_batches, h_p, w_p
+
+    temp_img = Image.open(train_paths[0]).convert("RGB")
+    temp_tokens, (h_p, w_p), _ = extractor.extract_tokens(
+        [temp_img],
+        args.image_res,
+        layers,
+        args.agg_method,
+        grouped_layers,
+        args.docrop,
+        use_clahe=args.use_clahe,
+        dino_saliency_layer=args.dino_saliency_layer,
+    )
+    feature_dim = temp_tokens.shape[-1]
+    aug_mult = (1 + args.aug_count) if aug_transform else 1
+    total_train_images = len(train_paths) * aug_mult
+    total_tokens = total_train_images * h_p * w_p
+    num_batches = math.ceil(total_train_images / args.batch_size)
+
+    def feature_generator():
+        all_imgs = []
+        for path in train_paths:
+            pil_img = Image.open(path).convert("RGB")
+            all_imgs.append(pil_img)
+            if aug_transform:
+                all_imgs.extend(aug_transform(pil_img) for _ in range(args.aug_count))
+        for i in range(0, len(all_imgs), args.batch_size):
+            img_batch = all_imgs[i : i + args.batch_size]
+            tokens_batch, _, saliency = extractor.extract_tokens(
+                img_batch,
+                args.image_res,
+                layers,
+                args.agg_method,
+                grouped_layers,
+                args.docrop,
+                use_clahe=args.use_clahe,
+                dino_saliency_layer=args.dino_saliency_layer,
+            )
+            tokens_flat = tokens_batch.reshape(-1, feature_dim)
+            if args.bg_mask_method == "dino_saliency":
+                tokens_flat = _apply_dino_train_mask(tokens_flat, saliency, args)
+            yield tokens_flat
+
+    return feature_generator, feature_dim, total_tokens, num_batches, h_p, w_p
+
+
+def _infer_batch_maps(
+    pil_imgs,
+    extractor,
+    pca_params,
+    args,
+    layers,
+    grouped_layers,
+    h_p,
+    w_p,
+    feature_dim,
+):
+    """Run the official H0 feature -> PCA residual -> post-process path for one batch."""
+    if args.patch_size:
+        anomaly_maps_batch, saliency_maps_batch = process_image_patched(
+            pil_imgs, extractor, pca_params, args, DEVICE, h_p, w_p, feature_dim
+        )
+        final_maps = []
+        for j, anomaly_map in enumerate(anomaly_maps_batch):
+            anomaly_map_final = anomaly_map
+            if args.use_specular_filter:
+                img_tensor = TF.to_tensor(pil_imgs[j]).unsqueeze(0).to(DEVICE)
+                _, _, conf = specular_mask_torch(img_tensor, tau=args.specular_tau)
+                conf = torch.nn.functional.interpolate(
+                    conf,
+                    size=anomaly_map_final.shape,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                conf_map = conf.squeeze().cpu().numpy()
+                anomaly_map_final = (
+                    filter_specular_anomalies(anomaly_map_final, conf_map).cpu().numpy()
+                )
+            final_maps.append(anomaly_map_final)
+        saliency_for_viz = (
+            None if args.feature_source == "anomalyvfm" else saliency_maps_batch
+        )
+        return final_maps, saliency_for_viz
+
+    tokens, (batch_h_p, batch_w_p), saliency_masks_batch = extractor.extract_tokens(
+        pil_imgs,
+        args.image_res,
+        layers,
+        args.agg_method,
+        grouped_layers,
+        args.docrop,
+        use_clahe=args.use_clahe,
+        dino_saliency_layer=args.dino_saliency_layer,
+    )
+    b, _, _, c = tokens.shape
+    scores = calculate_anomaly_scores(
+        tokens.reshape(b * batch_h_p * batch_w_p, c),
+        pca_params,
+        args.score_method,
+        args.drop_k,
+    )
+    anomaly_maps = scores.reshape(b, batch_h_p, batch_w_p)
+
+    mask_for_viz = None
+    background_mask = np.zeros_like(anomaly_maps, dtype=bool)
+    if args.bg_mask_method == "dino_saliency":
+        mask_for_viz = saliency_masks_batch
+        for j in range(b):
+            saliency_map = saliency_masks_batch[j]
+            try:
+                if args.mask_threshold_method == "percentile":
+                    threshold = np.percentile(
+                        saliency_map, args.percentile_threshold * 100
+                    )
+                    background_mask[j] = saliency_map < threshold
+                else:
+                    norm_mask = cv2.normalize(
+                        saliency_map,
+                        None,
+                        0,
+                        255,
+                        cv2.NORM_MINMAX,
+                        dtype=cv2.CV_8U,
+                    )
+                    _, binary_mask = cv2.threshold(
+                        norm_mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                    )
+                    background_mask[j] = binary_mask == 0
+            except Exception as exc:
+                logging.warning("DINO saliency mask failed: %s", exc)
+
+    elif args.bg_mask_method == "pca_normality":
+        threshold = 10.0
+        kernel_size = 3
+        border = 0.2
+        grid_size = (batch_h_p, batch_w_p)
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        mask_for_viz = np.zeros_like(anomaly_maps)
+        for j in range(b):
+            img_features = tokens[j].reshape(-1, c)
+            try:
+                pca = PCA(n_components=1, svd_solver="randomized")
+                first_pc = pca.fit_transform(img_features.astype(np.float32))
+                mask = first_pc > threshold
+                mask_2d = mask.reshape(grid_size)
+                h_start, h_end = int(grid_size[0] * border), int(grid_size[0] * (1 - border))
+                w_start, w_end = int(grid_size[1] * border), int(grid_size[1] * (1 - border))
+                center = mask_2d[h_start:h_end, w_start:w_end]
+                if center.sum() <= center.size * 0.35:
+                    mask_2d = (-first_pc > threshold).reshape(grid_size)
+                mask_processed = cv2.dilate(mask_2d.astype(np.uint8), kernel).astype(bool)
+                mask_processed = cv2.morphologyEx(
+                    mask_processed.astype(np.uint8), cv2.MORPH_CLOSE, kernel
+                ).astype(bool)
+                background_mask[j] = ~mask_processed
+                mask_for_viz[j] = mask_processed.astype(np.float32)
+            except Exception as exc:
+                logging.warning("PCA normality mask failed: %s", exc)
+
+    anomaly_maps[background_mask] = 0.0
+
+    if args.use_d1_denoise:
+        anomaly_maps = np.stack(
+            [
+                local_contrast_denoise(
+                    anomaly_map,
+                    sigma=args.d1_sigma,
+                    alpha=args.d1_alpha,
+                    blend=args.d1_lambda,
+                )
+                for anomaly_map in anomaly_maps
+            ],
+            axis=0,
+        )
+
+    if args.use_d2_denoise:
+        anomaly_maps = np.stack(
+            [
+                spatial_coherence_suppress(
+                    anomaly_map,
+                    percentile=args.d2_percentile,
+                    grid_size=args.d2_grid_size,
+                    strength=args.d2_lambda,
+                    min_weight=args.d2_min_weight,
+                )
+                for anomaly_map in anomaly_maps
+            ],
+            axis=0,
+        )
+
+    final_maps = []
+    for j in range(b):
+        anomaly_map_final = post_process_map(anomaly_maps[j], args.image_res)
+        if args.use_specular_filter:
+            img_tensor = TF.to_tensor(pil_imgs[j]).unsqueeze(0).to(DEVICE)
+            _, _, conf = specular_mask_torch(img_tensor, tau=args.specular_tau)
+            conf = torch.nn.functional.interpolate(
+                conf,
+                size=anomaly_map_final.shape,
+                mode="bilinear",
+                align_corners=False,
+            )
+            conf_map = conf.squeeze().cpu().numpy()
+            anomaly_map_final = (
+                filter_specular_anomalies(anomaly_map_final, conf_map).cpu().numpy()
+            )
+        final_maps.append(anomaly_map_final)
+    return final_maps, mask_for_viz
+
+
+def _write_csvs(
+    outdir,
+    category_results,
+    dataset_counts,
+    image_results,
+    validation_results,
+    final=False,
+):
+    """Persist progress after every category; append summary rows only at the end."""
+    category_df = pd.DataFrame(category_results, columns=CATEGORY_RESULT_COLUMNS)
+    counts_df = pd.DataFrame(dataset_counts, columns=DATASET_COUNT_COLUMNS)
+    image_df = pd.DataFrame(image_results, columns=IMAGE_RESULT_COLUMNS)
+    validation_df = pd.DataFrame(
+        validation_results, columns=VALIDATION_RESULT_COLUMNS
+    )
+
+    if final and not category_df.empty:
+        test_counts = counts_df.set_index("category")["test_total_count"].to_dict()
+        weights = np.array(
+            [float(test_counts.get(cat, 0)) for cat in category_df["category"]],
+            dtype=np.float64,
+        )
+        times = category_df["Avg_Inference_time"].to_numpy(dtype=np.float64)
+        valid_time = np.isfinite(times) & (weights > 0)
+        weighted_time = (
+            float(np.sum(times[valid_time] * weights[valid_time]) / np.sum(weights[valid_time]))
+            if valid_time.any()
+            else np.nan
+        )
+
+        summary = {
+            "category": "MacroAvg",
+            "pca_dim": _nanmean_or_nan(category_df["pca_dim"].to_numpy(dtype=float)),
+            "threshold": _nanmean_or_nan(category_df["threshold"].to_numpy(dtype=float)),
+            "TP": int(category_df["TP"].sum()),
+            "TN": int(category_df["TN"].sum()),
+            "FP": int(category_df["FP"].sum()),
+            "FN": int(category_df["FN"].sum()),
+            "fpr": _nanmean_or_nan(category_df["fpr"].to_numpy(dtype=float)),
+            "fnr": _nanmean_or_nan(category_df["fnr"].to_numpy(dtype=float)),
+            "Image_AUROC": _nanmean_or_nan(category_df["Image_AUROC"].to_numpy(dtype=float)),
+            "Image_AUPR": _nanmean_or_nan(category_df["Image_AUPR"].to_numpy(dtype=float)),
+            "Image_F1": _nanmean_or_nan(category_df["Image_F1"].to_numpy(dtype=float)),
+            "Avg_Inference_time": weighted_time,
+        }
+        category_df = pd.concat([category_df, pd.DataFrame([summary])], ignore_index=True)
+
+    if final and not counts_df.empty:
+        counts_summary = {"category": "ALL"}
+        for col in DATASET_COUNT_COLUMNS[1:]:
+            counts_summary[col] = int(counts_df[col].sum())
+        counts_df = pd.concat([counts_df, pd.DataFrame([counts_summary])], ignore_index=True)
+
+    category_df.to_csv(
+        os.path.join(outdir, "category_results.csv"), index=False, float_format="%.8f"
+    )
+    counts_df.to_csv(os.path.join(outdir, "dataset_counts.csv"), index=False)
+    image_df.to_csv(
+        os.path.join(outdir, "image_results.csv"), index=False, float_format="%.8f"
+    )
+    validation_df.to_csv(
+        os.path.join(outdir, "validation_results.csv"),
+        index=False,
+        float_format="%.8f",
+    )
+    return category_df, counts_df, image_df, validation_df
+
+
+def main():
+    args = get_args()
+
+    if args.fixed_heatmap_scale:
+        if args.fixed_heatmap_vmax is None:
+            raise ValueError(
+                "--fixed_heatmap_vmax is required when "
+                "--fixed_heatmap_scale is enabled."
+            )
+        if not np.isfinite(args.fixed_heatmap_vmin):
+            raise ValueError("--fixed_heatmap_vmin must be finite.")
+        if not np.isfinite(args.fixed_heatmap_vmax):
+            raise ValueError("--fixed_heatmap_vmax must be finite.")
+        if args.fixed_heatmap_vmax <= args.fixed_heatmap_vmin:
+            raise ValueError(
+                "--fixed_heatmap_vmax must be greater than "
+                "--fixed_heatmap_vmin."
+            )
+
+    if args.use_d1_denoise:
+        if args.patch_size:
+            raise ValueError(
+                "D1 local-contrast denoising is defined on the native raw patch "
+                "anomaly map and currently does not support --patch_size."
+            )
+        if args.d1_sigma <= 0:
+            raise ValueError("--d1_sigma must be > 0.")
+        if not 0.0 <= args.d1_alpha <= 1.0:
+            raise ValueError("--d1_alpha must be in [0, 1].")
+        if not 0.0 <= args.d1_lambda <= 1.0:
+            raise ValueError("--d1_lambda must be in [0, 1].")
+
+    if args.use_d2_denoise:
+        if args.patch_size:
+            raise ValueError(
+                "D2 spatial-coherence suppression is defined on the native raw "
+                "patch anomaly map and currently does not support --patch_size."
+            )
+        if not 0.0 <= args.d2_percentile < 100.0:
+            raise ValueError("--d2_percentile must be in [0, 100).")
+        if args.d2_grid_size < 2:
+            raise ValueError("--d2_grid_size must be >= 2.")
+        if not 0.0 <= args.d2_lambda <= 1.0:
+            raise ValueError("--d2_lambda must be in [0, 1].")
+        if not 0.0 <= args.d2_min_weight <= 1.0:
+            raise ValueError("--d2_min_weight must be in [0, 1].")
+
+    if args.seed is None:
+        print("No seed specified; aborting for reproducibility.")
+        return
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    args.outdir = os.path.join(args.outdir, _build_run_name(args))
     os.makedirs(args.outdir, exist_ok=True)
     setup_logging(args.outdir, not args.no_log_file)
     save_config(args)
 
-    # Augmentations
-    aug_transform = None
-    if args.k_shot is not None and args.aug_count > 0 and args.aug_list:
-        aug_transform = get_augmentation_transform(args.aug_list, args.image_res)
-        if not aug_transform.transforms:
-            logging.warning(
-                "Augmentation specified but no valid transforms were created. Disabling augmentations."
-            )
-            aug_transform = None
-
-    # Parse layer args
     layers = parse_layer_indices(args.layers)
     grouped_layers = (
         parse_grouped_layers(args.grouped_layers) if args.agg_method == "group" else []
     )
+    extractor = _build_feature_extractor(args)
 
-    # Init model
-    extractor = FeatureExtractor(args.model_ckpt)
-
-    # Get dataset categories
     if args.categories:
-        categories = args.categories
+        categories = [c for c in args.categories if c != ".ipynb_checkpoints"]
     else:
         categories = sorted(
-            [
-                f.name
-                for f in Path(args.dataset_path).iterdir()
-                if f.is_dir() and f.name != "split_csv"
-            ]
+            f.name
+            for f in Path(args.dataset_path).iterdir()
+            if f.is_dir()
+            and f.name not in {"split_csv", ".ipynb_checkpoints"}
         )
 
-    # Main loop
-    all_results = []
+    category_results = []
+    dataset_counts = []
+    image_results = []
+    validation_results = []
+
     for category in categories:
-        logging.info(f"--- Processing Category: {category} ---")
-
-        if args.k_shot is not None and args.aug_count > 0 and args.aug_list:
-            aug_transform = get_augmentation_transform(args.aug_list, args.image_res)
-
-        else:
-            aug_transform = None
-        if category in args.no_aug_categories:
-            logging.warning(f"Disabling augmentation for {category} category")
-            aug_transform = None
+        logging.info("--- Processing Category: %s ---", category)
         handler = get_dataset_handler(args.dataset_name, args.dataset_path, category)
-        train_paths = handler.get_train_paths()
-        val_paths = handler.get_validation_paths()
-        test_paths = handler.get_test_paths()
+
+        train_paths_all = handler.get_train_paths()
+        val_paths_all = handler.get_validation_paths()
+        test_paths_all = handler.get_test_paths()
+
+        test_labels_all = [handler.get_image_label(p) for p in test_paths_all]
+        dataset_counts.append(
+            {
+                "category": category,
+                "train_good_count": len(train_paths_all),
+                "val_good_count": sum(handler.get_image_label(p) == 0 for p in val_paths_all),
+                "test_good_count": sum(label == 0 for label in test_labels_all),
+                "test_bad_count": sum(label == 1 for label in test_labels_all),
+                "test_total_count": len(test_paths_all),
+            }
+        )
+
+        train_paths = list(train_paths_all)
+        val_paths = list(val_paths_all)
+        test_paths = list(test_paths_all)
 
         if args.debug_limit is not None:
             logging.warning(
-                f"--- DEBUG MODE: Limiting validation and test sets to {args.debug_limit} images ---"
+                "DEBUG MODE: limiting validation/test to %d images.", args.debug_limit
             )
-            if val_paths:
-                val_paths = val_paths[: args.debug_limit]
-            if test_paths:
-                test_paths = test_paths[: args.debug_limit]
+            val_paths = val_paths[: args.debug_limit]
+            test_paths = test_paths[: args.debug_limit]
 
         if not train_paths:
-            logging.warning(f"No training images found for {category}. Skipping.")
+            logging.warning("No training images found for %s. Skipping.", category)
+            _write_csvs(
+                args.outdir,
+                category_results,
+                dataset_counts,
+                image_results,
+                validation_results,
+            )
             continue
 
         if args.batched_zero_shot:
-            # Batched 0-shot train=test
-            logging.info(
-                f"--- Batched 0-Shot Mode: Fitting PCA on {len(test_paths)} test images ---"
-            )
+            logging.info("Batched zero-shot: fitting PCA on test images.")
             train_paths = test_paths.copy()
-            val_paths = None
+            val_paths = []
 
-        # K-shot sampling
         if args.k_shot is not None:
-            if args.k_shot > len(train_paths):
-                logging.warning(
-                    f"Requested k_shot={args.k_shot} but only {len(train_paths)} training images available. Using all {len(train_paths)}."
-                )
-            else:
-                logging.info(
-                    f"--- K-SHOT: Randomly sampling {args.k_shot} training images ---"
-                )
+            if args.k_shot < len(train_paths):
                 random.shuffle(train_paths)
-                train_paths = (
-                    train_paths[: args.k_shot]
-                    if args.k_shot <= len(train_paths)
-                    else train_paths
+                train_paths = train_paths[: args.k_shot]
+            elif args.k_shot > len(train_paths):
+                logging.warning(
+                    "Requested k_shot=%d but only %d images exist; using all.",
+                    args.k_shot,
+                    len(train_paths),
                 )
-                for i, path in enumerate(train_paths):
-                    logging.info(
-                        f"  K-Shot image {i + 1}/{args.k_shot}: {Path(path).name}"
-                    )
+            for idx, path in enumerate(train_paths, 1):
+                logging.info("K-shot image %d/%d: %s", idx, len(train_paths), Path(path).name)
 
-        # 1. Fit PCA Model
-        if args.patch_size:
-            if args.bg_mask_method == "pca_normality":
-                logging.error(
-                    "PCA Normality mask is not compatible with --patch_size. "
-                    "Use 'dino_saliency' or no mask."
-                )
-                raise ValueError("Cannot use pca_normality mask with patch_size.")
+        aug_transform = None
+        if args.k_shot is not None and args.aug_count > 0 and args.aug_list:
+            aug_transform = get_augmentation_transform(args.aug_list, args.image_res)
+            if not aug_transform.transforms:
+                aug_transform = None
+        if category in args.no_aug_categories:
+            logging.warning("Disabling augmentation for category %s", category)
+            aug_transform = None
 
-            temp_img = Image.open(train_paths[0]).convert("RGB")
-            temp_patch = temp_img.crop((0, 0, args.patch_size, args.patch_size))
-            temp_tokens, (h_p, w_p), _ = extractor.extract_tokens(
-                [temp_patch],
-                args.image_res,
-                layers,
-                args.agg_method,
-                grouped_layers,
-                args.docrop,
-                use_clahe=args.use_clahe,
-                dino_saliency_layer=args.dino_saliency_layer,
-            )
-            feature_dim = temp_tokens.shape[-1]
-            tokens_per_patch = h_p * w_p
-
-            # Calculate total number of patches and tokens (with augmentations)
-            total_patches = 0
-            num_batches = 0
-            # This multiplier accounts for the original image + N augmented images
-            num_aug_multiplier = (1 + args.aug_count) if aug_transform else 1
-
-            for path in train_paths:
-                img = Image.open(path).convert("RGB")
-                patch_coords = get_patch_coords(
-                    img.height, img.width, args.patch_size, args.patch_overlap
-                )
-                total_patches += len(patch_coords) * num_aug_multiplier
-                num_batches += (
-                    math.ceil(len(patch_coords) / args.batch_size) * num_aug_multiplier
-                )
-            total_tokens = total_patches * tokens_per_patch
-
-            logging.info(
-                f"Feature dim: {feature_dim}, Tokens per patch: {tokens_per_patch}, "
-                f"Base train patches: {total_patches // num_aug_multiplier}, "
-                f"Total train patches (w/ aug): {total_patches}, Total train tokens: {total_tokens}"
-            )
-
-            def feature_generator_patched():
-                for path in train_paths:
-                    pil_img = Image.open(path).convert("RGB")
-
-                    # Create a list of images to process: original + augmentations
-                    images_to_process = [pil_img]
-                    if aug_transform:
-                        for _ in range(args.aug_count):
-                            images_to_process.append(aug_transform(pil_img))
-
-                    # Process each image (original + augmented)
-                    for img in images_to_process:
-                        patch_coords = get_patch_coords(
-                            img.height,
-                            img.width,
-                            args.patch_size,
-                            args.patch_overlap,
-                        )
-                        for i in range(0, len(patch_coords), args.batch_size):
-                            coord_batch = patch_coords[i : i + args.batch_size]
-                            patch_batch = [img.crop(c) for c in coord_batch]
-                            (
-                                tokens_batch,
-                                _,
-                                saliency_masks_batch,
-                            ) = extractor.extract_tokens(
-                                patch_batch,
-                                args.image_res,
-                                layers,
-                                args.agg_method,
-                                grouped_layers,
-                                args.docrop,
-                                use_clahe=args.use_clahe,
-                                dino_saliency_layer=args.dino_saliency_layer,
-                            )
-                            tokens_flat = tokens_batch.reshape(-1, feature_dim)
-
-                            if args.bg_mask_method == "dino_saliency":
-                                masks_flat = saliency_masks_batch.reshape(-1)
-                                try:
-                                    if args.mask_threshold_method == "percentile":
-                                        threshold = np.percentile(
-                                            masks_flat, args.percentile_threshold * 100
-                                        )
-                                        foreground_tokens = tokens_flat[
-                                            masks_flat >= threshold
-                                        ]
-                                    else:
-                                        norm_mask = cv2.normalize(
-                                            masks_flat,
-                                            None,
-                                            0,
-                                            255,
-                                            cv2.NORM_MINMAX,
-                                            dtype=cv2.CV_8U,
-                                        )
-                                        _, binary_mask = cv2.threshold(
-                                            norm_mask,
-                                            0,
-                                            255,
-                                            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                                        )
-                                        foreground_tokens = tokens_flat[
-                                            binary_mask.flatten() > 0
-                                        ]
-
-                                    if foreground_tokens.shape[0] > 0:
-                                        yield foreground_tokens
-                                    else:
-                                        logging.warning(
-                                            "No foreground patch tokens found. Yielding all tokens."
-                                        )
-                                        yield tokens_flat
-                                except Exception as e:
-                                    logging.warning(
-                                        f"Masking failed: {e}. Yielding all tokens."
-                                    )
-                                    yield tokens_flat
-                            else:
-                                yield tokens_flat
-
-            feature_generator = feature_generator_patched
-
-        else:
-            # PCA without patching
-            temp_img = Image.open(train_paths[0]).convert("RGB")
-            temp_tokens, (h_p, w_p), _ = extractor.extract_tokens(
-                [temp_img],
-                args.image_res,
-                layers,
-                args.agg_method,
-                grouped_layers,
-                args.docrop,
-                use_clahe=args.use_clahe,
-                dino_saliency_layer=args.dino_saliency_layer,
-            )
-            feature_dim = temp_tokens.shape[-1]
-            num_aug_multiplier = (1 + args.aug_count) if aug_transform else 1
-            total_train_images = len(train_paths) * num_aug_multiplier
-            total_tokens = total_train_images * h_p * w_p
-
-            logging.info(
-                f"Feature dim: {feature_dim}, Tokens per image: {h_p * w_p}, "
-                f"Base train images: {len(train_paths)}, "
-                f"Total train images (w/ aug): {total_train_images}, Total train tokens: {total_tokens}"
-            )
-
-            def feature_generator_full():
-                all_imgs_to_process = []
-                for path in train_paths:
-                    pil_img = Image.open(path).convert("RGB")
-                    all_imgs_to_process.append(pil_img)
-                    if aug_transform:
-                        for _ in range(args.aug_count):
-                            all_imgs_to_process.append(aug_transform(pil_img))
-
-                # Now process all_imgs_to_process in batches
-                for i in range(0, len(all_imgs_to_process), args.batch_size):
-                    img_batch = all_imgs_to_process[i : i + args.batch_size]
-                    (
-                        tokens_batch,
-                        _,
-                        saliency_masks_batch,
-                    ) = extractor.extract_tokens(
-                        img_batch,
-                        args.image_res,
-                        layers,
-                        args.agg_method,
-                        grouped_layers,
-                        args.docrop,
-                        use_clahe=args.use_clahe,
-                        dino_saliency_layer=args.dino_saliency_layer,
-                    )
-                    tokens_flat = tokens_batch.reshape(-1, feature_dim)
-
-                    # Train masking logic
-                    if args.bg_mask_method == "dino_saliency":
-                        masks_flat = saliency_masks_batch.reshape(-1)
-                        try:
-                            if args.mask_threshold_method == "percentile":
-                                threshold = np.percentile(
-                                    masks_flat, args.percentile_threshold * 100
-                                )
-                                foreground_tokens = tokens_flat[masks_flat >= threshold]
-                            else:
-                                norm_mask = cv2.normalize(
-                                    masks_flat,
-                                    None,
-                                    0,
-                                    255,
-                                    cv2.NORM_MINMAX,
-                                    dtype=cv2.CV_8U,
-                                )
-                                _, binary_mask = cv2.threshold(
-                                    norm_mask,
-                                    0,
-                                    255,
-                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                                )
-                                foreground_tokens = tokens_flat[
-                                    binary_mask.flatten() > 0
-                                ]
-
-                            if foreground_tokens.shape[0] > 0:
-                                yield foreground_tokens
-                            else:
-                                logging.warning(
-                                    "No foreground tokens found. Yielding all tokens."
-                                )
-                                yield tokens_flat
-                        except Exception as e:
-                            logging.warning(
-                                f"Masking failed: {e}. Yielding all tokens."
-                            )
-                            yield tokens_flat
-                    else:
-                        yield tokens_flat
-
-            num_batches = math.ceil(total_train_images / args.batch_size)
-            feature_generator = feature_generator_full
+        (
+            feature_generator,
+            feature_dim,
+            total_tokens,
+            num_batches,
+            h_p,
+            w_p,
+        ) = _prepare_pca_training(
+            train_paths, extractor, args, layers, grouped_layers, aug_transform
+        )
+        logging.info(
+            "Feature dim=%d, total PCA tokens=%d, PCA batches=%d",
+            feature_dim,
+            total_tokens,
+            num_batches,
+        )
 
         if args.use_kernel_pca:
-            if args.bg_mask_method == "pca_normality":
-                logging.error(
-                    "PCA Normality mask is not compatible with Kernel PCA. "
-                    "Use 'dino_saliency' or no mask."
-                )
-                raise ValueError("Cannot use pca_normality mask with use_kernel_pca.")
-
-            logging.info("Collecting all features for Kernel PCA...")
             all_train_tokens = np.concatenate(
-                list(
-                    tqdm(
-                        feature_generator(),
-                        desc="Feature Collection",
-                        total=num_batches,
-                    )
-                )
+                list(tqdm(feature_generator(), desc="Feature Collection", total=num_batches))
             )
             pca_model = KernelPCAModel(
                 k=args.pca_dim,
@@ -586,785 +903,298 @@ def main():
         else:
             pca_model = PCAModel(k=args.pca_dim, ev=args.pca_ev, whiten=args.whiten)
             pca_params = pca_model.fit(
-                feature_generator,
-                feature_dim,
-                total_tokens,
-                num_batches,
+                feature_generator, feature_dim, total_tokens, num_batches
             )
 
-        # 2. Determine PR-optimal F1 thresholds (if validation set exists)
+        actual_pca_dim = _get_pca_dim(pca_params)
+        logging.info("Actual fitted PCA dimension for %s: %s", category, actual_pca_dim)
+
+        # Validation threshold. Your wafer validation set is normal-only, so this
+        # normally uses the negative quantile fallback controlled by target_img_fpr.
+        # Raw validation scores are also saved so score distributions can be
+        # analyzed later without re-running DINOv2/PCA inference.
+        thr_img = None
         if val_paths:
-            logging.info(
-                f"Collecting validation stats on {len(val_paths)} images for PR-optimal F1 thresholds..."
-            )
-            val_img_scores, val_img_labels = [], []
-            val_px_scores_normalized, val_px_gts = [], []
-            val_iter = tqdm(val_paths, desc="Validating")
-            for i in range(0, len(val_paths), args.batch_size):
+            val_scores, val_labels, val_score_paths = [], [], []
+            for i in tqdm(range(0, len(val_paths), args.batch_size), desc=f"Validating {category}"):
                 path_batch = val_paths[i : i + args.batch_size]
                 pil_imgs = [Image.open(p).convert("RGB") for p in path_batch]
-                is_anomaly_batch = [
-                    "good" not in str(p) and "Normal" not in str(p) for p in path_batch
-                ]
+                maps, _ = _infer_batch_maps(
+                    pil_imgs,
+                    extractor,
+                    pca_params,
+                    args,
+                    layers,
+                    grouped_layers,
+                    h_p,
+                    w_p,
+                    feature_dim,
+                )
+                for path, anomaly_map in zip(path_batch, maps):
+                    val_score_paths.append(path)
+                    val_scores.append(_aggregate_image_score(anomaly_map, args.img_score_agg))
+                    val_labels.append(handler.get_image_label(path))
 
-                if args.patch_size:
-                    anomaly_maps_batch, _ = process_image_patched(
-                        pil_imgs,
-                        extractor,
-                        pca_params,
-                        args,
-                        DEVICE,
-                        h_p,
-                        w_p,
-                        feature_dim,
-                    )
-                    for j, anomaly_map_final in enumerate(anomaly_maps_batch):
-                        if args.img_score_agg == "max":
-                            img_score = float(np.max(anomaly_map_final))
-                        elif args.img_score_agg == "p99":
-                            img_score = float(np.percentile(anomaly_map_final, 99))
-                        elif args.img_score_agg == "mtop5":
-                            img_score = float(
-                                np.mean(np.sort(anomaly_map_final.flatten())[-5:])
-                            )
-                        elif args.img_score_agg == "mtop1p":
-                            img_score = topk_mean(anomaly_map_final, frac=0.01)
-                        else:
-                            img_score = float(np.mean(anomaly_map_final))
-                        val_img_scores.append(img_score)
-                        val_img_labels.append(1 if is_anomaly_batch[j] else 0)
-
-                        # --- PIXEL METRICS (AUPRO, P-F1) ---
-                        anomaly_map_normalized = min_max_norm(anomaly_map_final)
-                        H, W = anomaly_map_normalized.shape
-                        gt_mask = handler.get_ground_truth_mask(
-                            path_batch[j], pil_imgs[j].size
-                        )
-                        gt_mask = (
-                            np.array(
-                                Image.fromarray(
-                                    (gt_mask.astype(np.uint8) * 255)
-                                ).resize((W, H), resample=Image.NEAREST)
-                            )
-                            > 127
-                        )
-                        val_px_gts.extend(gt_mask.flatten().astype(np.uint8))
-                        val_px_scores_normalized.extend(
-                            anomaly_map_normalized.flatten().astype(np.float32)
-                        )
-
-                else:
-                    (
-                        tokens,
-                        (h_p, w_p),
-                        saliency_masks_batch,
-                    ) = extractor.extract_tokens(
-                        pil_imgs,
-                        args.image_res,
-                        layers,
-                        args.agg_method,
-                        grouped_layers,
-                        args.docrop,
-                        use_clahe=args.use_clahe,
-                        dino_saliency_layer=args.dino_saliency_layer,
-                    )
-                    b, _, _, c = tokens.shape
-                    tokens_reshaped = tokens.reshape(b * h_p * w_p, c)
-
-                    scores = calculate_anomaly_scores(
-                        tokens_reshaped,
-                        pca_params,
-                        args.score_method,
-                        args.drop_k,
-                    )
-                    anomaly_maps = scores.reshape(b, h_p, w_p)
-
-                    # Apply masking to validation
-                    if args.bg_mask_method == "dino_saliency":
-                        background_mask = np.zeros_like(anomaly_maps, dtype=bool)
-                        for j in range(b):
-                            saliency_map = saliency_masks_batch[j]
-                            try:
-                                if args.mask_threshold_method == "percentile":
-                                    threshold = np.percentile(
-                                        saliency_map, args.percentile_threshold * 100
-                                    )
-                                    background_mask[j] = saliency_map < threshold
-                                else:  # otsu
-                                    norm_mask = cv2.normalize(
-                                        saliency_map,
-                                        None,
-                                        0,
-                                        255,
-                                        cv2.NORM_MINMAX,
-                                        dtype=cv2.CV_8U,
-                                    )
-                                    _, binary_mask = cv2.threshold(
-                                        norm_mask,
-                                        0,
-                                        255,
-                                        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                                    )
-                                    background_mask[j] = binary_mask == 0
-                            except Exception as e:
-                                logging.warning(
-                                    f"Saliency mask failed for val image {j}: {e}. Skipping mask."
-                                )
-                        anomaly_maps[background_mask] = 0.0
-
-                    elif args.bg_mask_method == "pca_normality":
-                        # AnomalyDINO PCA mask
-                        threshold = 10.0
-                        kernel_size = 3
-                        border = 0.2
-                        grid_size = (h_p, w_p)
-                        kernel = np.ones(
-                            (kernel_size, kernel_size), np.uint8
-                        )  # Pre-define kernel
-
-                        background_mask_batch = np.zeros_like(anomaly_maps, dtype=bool)
-
-                        for j in range(b):
-                            img_features = tokens[j].reshape(-1, c)
-
-                            try:
-                                pca = PCA(n_components=1, svd_solver="randomized")
-                                first_pc = pca.fit_transform(
-                                    img_features.astype(np.float32)
-                                )
-
-                                mask = first_pc > threshold
-                                mask_2d = mask.reshape(grid_size)
-                                h_start, h_end = int(grid_size[0] * border), int(
-                                    grid_size[0] * (1 - border)
-                                )
-                                w_start, w_end = int(grid_size[1] * border), int(
-                                    grid_size[1] * (1 - border)
-                                )
-                                m = mask_2d[h_start:h_end, w_start:w_end]
-
-                                if m.sum() <= m.size * 0.35:
-                                    mask = -first_pc > threshold
-                                    mask_2d = mask.reshape(grid_size)
-
-                                # Post-process foreground mask
-                                mask_processed = cv2.dilate(
-                                    mask_2d.astype(np.uint8), kernel
-                                ).astype(bool)
-                                mask_processed = cv2.morphologyEx(
-                                    mask_processed.astype(np.uint8),
-                                    cv2.MORPH_CLOSE,
-                                    kernel,
-                                ).astype(bool)
-
-                                # Invert the foreground mask to get the background mask
-                                background_mask_batch[j] = ~mask_processed
-
-                            except Exception as e:
-                                logging.warning(
-                                    f"PCA mask failed for val image {j}: {e}. Skipping mask."
-                                )
-
-                        anomaly_maps[background_mask_batch] = 0.0
-                    for j in range(anomaly_maps.shape[0]):
-                        anomaly_map_final = post_process_map(
-                            anomaly_maps[j], args.image_res
-                        )
-
-                        if args.use_specular_filter:
-                            img_tensor = (
-                                TF.to_tensor(pil_imgs[j]).unsqueeze(0).to(DEVICE)
-                            )
-                            _, _, conf = specular_mask_torch(
-                                img_tensor, tau=args.specular_tau
-                            )
-                            conf = torch.nn.functional.interpolate(
-                                conf,
-                                size=anomaly_map_final.shape,
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                            conf_map = conf.squeeze().cpu().numpy()
-                            anomaly_map_final = (
-                                filter_specular_anomalies(anomaly_map_final, conf_map)
-                                .cpu()
-                                .numpy()
-                            )
-                        if args.img_score_agg == "max":
-                            img_score = float(np.max(anomaly_map_final))
-                        elif args.img_score_agg == "p99":
-                            img_score = float(np.percentile(anomaly_map_final, 99))
-                        elif args.img_score_agg == "mtop5":
-                            img_score = float(
-                                np.mean(np.sort(anomaly_map_final.flatten())[-5:])
-                            )
-                        elif args.img_score_agg == "mtop1p":
-                            img_score = topk_mean(anomaly_map_final, frac=0.01)
-                        else:
-                            img_score = float(np.mean(anomaly_map_final))
-                        val_img_scores.append(img_score)
-                        val_img_labels.append(1 if is_anomaly_batch[j] else 0)
-                        anomaly_map_normalized = min_max_norm(anomaly_map_final)
-                        H, W = anomaly_map_normalized.shape
-                        gt_path_str = handler.get_ground_truth_path(path_batch[j])
-
-                        if not gt_path_str or not os.path.exists(gt_path_str):
-                            gt_mask = np.zeros((H, W), dtype=np.uint8)
-                        else:
-                            gt_mask_pil = Image.open(gt_path_str).convert("L")
-
-                            if args.docrop:
-                                resize_res = int(args.image_res / 0.875)
-                                gt_mask_pil = TF.resize(
-                                    gt_mask_pil,
-                                    (resize_res, resize_res),
-                                    interpolation=TF.InterpolationMode.NEAREST,
-                                )
-                                gt_mask_pil = TF.center_crop(
-                                    gt_mask_pil, (args.image_res, args.image_res)
-                                )
-
-                            gt_mask_pil = TF.resize(
-                                gt_mask_pil,
-                                (H, W),
-                                interpolation=TF.InterpolationMode.NEAREST,
-                            )
-                            gt_mask = (np.array(gt_mask_pil) > 0).astype(np.uint8)
-
-                        val_px_gts.extend(gt_mask.flatten().astype(np.uint8))
-                        val_px_scores_normalized.extend(
-                            anomaly_map_normalized.flatten().astype(np.float32)
-                        )
-                val_iter.update(len(path_batch))
-
-            target_img_fpr = getattr(args, "target_img_fpr", 0.05)
-            target_px_fpr = getattr(args, "target_px_fpr", 0.05)
-
-            # Threshold for I-F1 (using raw image scores)
             thr_img, how_img = _pick_threshold_with_fallback(
-                val_img_labels, val_img_scores, target_img_fpr
+                val_labels, val_scores, args.target_img_fpr
             )
-            # Threshold for P-F1 (using per-image normalized pixel scores)
-            val_px_scores_mm = np.array(val_px_scores_normalized)
-            thr_px, how_px = _pick_threshold_with_fallback(
-                val_px_gts, val_px_scores_mm, target_px_fpr
-            )
-
-            if how_img == "none":
-                logging.warning(
-                    "Validation image threshold degenerate and no negatives: image F1 will be NaN."
-                )
-            if how_px == "none":
-                logging.warning(
-                    "Validation pixel threshold degenerate and no negatives: pixel F1 will be NaN."
-                )
-
             logging.info(
-                f"Chosen thresholds — Image: {thr_img if thr_img is not None else float('nan'):.6g} "
-                f"({how_img}), Pixel: {thr_px if thr_px is not None else float('nan'):.6g} ({how_px})"
+                "Chosen image threshold for %s: %s (%s)",
+                category,
+                f"{thr_img:.8f}" if thr_img is not None else "N/A",
+                how_img,
             )
 
+            for path, gt_label, val_score in zip(
+                val_score_paths, val_labels, val_scores
+            ):
+                pred_label = (
+                    int(val_score >= thr_img) if thr_img is not None else None
+                )
+                result_type = (
+                    _result_type(int(gt_label), pred_label)
+                    if pred_label is not None
+                    else "N/A"
+                )
+                validation_results.append(
+                    {
+                        "category": category,
+                        "image_path": str(Path(path).resolve()),
+                        "pca_dim": actual_pca_dim,
+                        "gt_label": int(gt_label),
+                        "anomaly_score": float(val_score),
+                        "threshold": (
+                            float(thr_img) if thr_img is not None else np.nan
+                        ),
+                        "pred_label": (
+                            pred_label if pred_label is not None else np.nan
+                        ),
+                        "result_type": result_type,
+                    }
+                )
         else:
-            logging.warning("No validation set found. F1 scores will be N/A.")
-            thr_img, thr_px = None, None
+            logging.warning("No validation images for %s; predictions/F1 unavailable.", category)
 
-        # Warm up for timing
+        # GPU warm-up is outside timing.
         if test_paths:
-            logging.info("Performing warm-up inference run...")
             try:
-                # Use the first test image for the warm-up
                 dummy_img = [Image.open(test_paths[0]).convert("RGB")]
-
-                if args.patch_size:
-                    # Warm-up the patch pipeline
-                    _ = process_image_patched(
-                        dummy_img,
-                        extractor,
-                        pca_params,
-                        args,
-                        DEVICE,
-                        h_p,
-                        w_p,
-                        feature_dim,
-                    )
-                else:
-                    # Warm-up the full-image pipeline
-                    _tokens, (_h, _w), _saliency = extractor.extract_tokens(
-                        dummy_img,
-                        args.image_res,
-                        layers,
-                        args.agg_method,
-                        grouped_layers,
-                        args.docrop,
-                        use_clahe=args.use_clahe,
-                        dino_saliency_layer=args.dino_saliency_layer,
-                    )
-                    # A minimal version of the scoring
-                    _scores = calculate_anomaly_scores(
-                        _tokens.reshape(-1, _tokens.shape[-1]),
-                        pca_params,
-                        args.score_method,
-                        args.drop_k,
-                    )
-                    if args.use_specular_filter and torch.cuda.is_available():
-                        _ = filter_specular_anomalies(
-                            torch.from_numpy(_scores).to(DEVICE),
-                            torch.zeros_like(torch.from_numpy(_scores)).to(DEVICE),
-                        )
-
+                maps, _ = _infer_batch_maps(
+                    dummy_img,
+                    extractor,
+                    pca_params,
+                    args,
+                    layers,
+                    grouped_layers,
+                    h_p,
+                    w_p,
+                    feature_dim,
+                )
+                _ = _aggregate_image_score(maps[0], args.img_score_agg)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize(DEVICE)
-                logging.info("Warm-up complete.")
-            except Exception as e:
-                logging.warning(
-                    f"Warm-up run failed: {e}. First timed run may be slow."
-                )
+            except Exception as exc:
+                logging.warning("Warm-up failed: %s", exc)
 
-        # 3. Evaluate on Test Set
-        logging.info(f"Evaluating on {len(test_paths)} test images...")
-        img_true, img_pred_f1 = [], []
-        img_pred_auroc = []
-        px_true_all = []
-        px_pred_all_auroc = []
-        px_pred_all_normalized = []
-        pro_gt_masks = []
-        pro_anomaly_maps = []
+        img_true = []
+        img_scores = []
+        img_preds = []
+        category_times = []
         vis_saved_count = 0
-        all_inference_times = []
 
-        logging.info("Number of test images: {}".format(len(test_paths)))
-        test_iter = tqdm(test_paths, desc=f"Testing {category}")
-        for i in range(0, len(test_paths), args.batch_size):
+        for i in tqdm(range(0, len(test_paths), args.batch_size), desc=f"Testing {category}"):
             path_batch = test_paths[i : i + args.batch_size]
             pil_imgs = [Image.open(p).convert("RGB") for p in path_batch]
-            is_anomaly_batch = [
-                "good" not in str(p) and "Normal" not in str(p) for p in path_batch
-            ]
+
             if torch.cuda.is_available():
                 torch.cuda.synchronize(DEVICE)
             start_time = time.perf_counter()
 
-            final_anomaly_maps_for_batch = []
-            saliency_maps_for_viz_batch = []
+            maps, saliency_maps = _infer_batch_maps(
+                pil_imgs,
+                extractor,
+                pca_params,
+                args,
+                layers,
+                grouped_layers,
+                h_p,
+                w_p,
+                feature_dim,
+            )
+            batch_scores = [
+                _aggregate_image_score(anomaly_map, args.img_score_agg)
+                for anomaly_map in maps
+            ]
 
-            if args.patch_size:
-                (
-                    anomaly_maps_batch,
-                    saliency_maps_batch,
-                ) = process_image_patched(
-                    pil_imgs, extractor, pca_params, args, DEVICE, h_p, w_p, feature_dim
-                )
-
-                saliency_maps_for_viz_batch = saliency_maps_batch
-
-                for j, anomaly_map_pre_specular in enumerate(anomaly_maps_batch):
-                    anomaly_map_final = anomaly_map_pre_specular
-                    if args.use_specular_filter:
-                        img_tensor = TF.to_tensor(pil_imgs[j]).unsqueeze(0).to(DEVICE)
-                        _, _, conf = specular_mask_torch(
-                            img_tensor, tau=args.specular_tau
-                        )
-                        conf = torch.nn.functional.interpolate(
-                            conf,
-                            size=anomaly_map_pre_specular.shape,
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        conf_map = conf.squeeze().cpu().numpy()
-                        anomaly_map_final = (
-                            filter_specular_anomalies(
-                                anomaly_map_pre_specular, conf_map
-                            )
-                            .cpu()
-                            .numpy()
-                        )
-                    final_anomaly_maps_for_batch.append(anomaly_map_final)
-
-            else:
-                # Step 1: Feature Extraction
-                (
-                    tokens,
-                    (h_p, w_p),
-                    saliency_masks_batch,
-                ) = extractor.extract_tokens(
-                    pil_imgs,
-                    args.image_res,
-                    layers,
-                    args.agg_method,
-                    grouped_layers,
-                    args.docrop,
-                    use_clahe=args.use_clahe,
-                    dino_saliency_layer=args.dino_saliency_layer,
-                )
-                b, _, _, c = tokens.shape
-                tokens_reshaped = tokens.reshape(b * h_p * w_p, c)
-
-                # Step 2: Anomaly Scoring
-                scores = calculate_anomaly_scores(
-                    tokens_reshaped,
-                    pca_params,
-                    args.score_method,
-                    args.drop_k,
-                )
-                anomaly_maps = scores.reshape(b, h_p, w_p)
-
-                # Step 3: Masking Strategy
-                mask_for_viz = None
-                background_mask = np.zeros_like(anomaly_maps, dtype=bool)
-
-                if args.bg_mask_method == "dino_saliency":
-                    mask_for_viz = saliency_masks_batch
-                    for j in range(b):
-                        saliency_map = saliency_masks_batch[j]
-                        try:
-                            if args.mask_threshold_method == "percentile":
-                                threshold = np.percentile(
-                                    saliency_map, args.percentile_threshold * 100
-                                )
-                                background_mask[j] = saliency_map < threshold
-                            else:  # otsu
-                                norm_mask = cv2.normalize(
-                                    saliency_map,
-                                    None,
-                                    0,
-                                    255,
-                                    cv2.NORM_MINMAX,
-                                    dtype=cv2.CV_8U,
-                                )
-                                _, binary_mask = cv2.threshold(
-                                    norm_mask,
-                                    0,
-                                    255,
-                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                                )
-                                background_mask[j] = binary_mask == 0
-                        except Exception as e:
-                            logging.warning(
-                                f"Saliency mask failed for test image {j}: {e}. Skipping mask."
-                            )
-
-                elif args.bg_mask_method == "pca_normality":
-                    threshold = 10.0
-                    kernel_size = 3
-                    border = 0.2
-                    grid_size = (h_p, w_p)
-                    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-                    mask_for_viz = np.zeros_like(anomaly_maps)
-
-                    for j in range(b):
-                        img_features = tokens[j].reshape(-1, c)
-                        try:
-                            pca = PCA(n_components=1, svd_solver="randomized")
-                            first_pc = pca.fit_transform(
-                                img_features.astype(np.float32)
-                            )
-                            mask = first_pc > threshold
-                            mask_2d = mask.reshape(grid_size)
-
-                            h_start, h_end = int(grid_size[0] * border), int(
-                                grid_size[0] * (1 - border)
-                            )
-                            w_start, w_end = int(grid_size[1] * border), int(
-                                grid_size[1] * (1 - border)
-                            )
-                            m = mask_2d[h_start:h_end, w_start:w_end]
-
-                            if m.sum() <= m.size * 0.35:
-                                mask = -first_pc > threshold
-                                mask_2d = mask.reshape(grid_size)
-
-                            mask_processed = cv2.dilate(
-                                mask_2d.astype(np.uint8), kernel
-                            ).astype(bool)
-                            mask_processed = cv2.morphologyEx(
-                                mask_processed.astype(np.uint8), cv2.MORPH_CLOSE, kernel
-                            ).astype(bool)
-
-                            background_mask[j] = ~mask_processed
-                            mask_for_viz[j] = mask_processed.astype(np.float32)
-                        except Exception as e:
-                            logging.warning(
-                                f"PCA mask failed for test image {j}: {e}. Skipping mask."
-                            )
-
-                anomaly_maps[background_mask] = 0.0
-
-                saliency_maps_for_viz_batch = mask_for_viz
-
-                for j in range(anomaly_maps.shape[0]):
-                    pil_img = pil_imgs[j]
-                    anomaly_map_pre_specular = post_process_map(
-                        anomaly_maps[j], args.image_res
-                    )
-                    anomaly_map_final = anomaly_map_pre_specular
-                    if args.use_specular_filter:
-                        img_tensor = TF.to_tensor(pil_imgs[j]).unsqueeze(0).to(DEVICE)
-                        _, _, conf = specular_mask_torch(
-                            img_tensor, tau=args.specular_tau
-                        )
-                        conf = torch.nn.functional.interpolate(
-                            conf,
-                            size=anomaly_map_final.shape,
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        conf_map = conf.squeeze().cpu().numpy()
-                        anomaly_map_final = (
-                            filter_specular_anomalies(anomaly_map_final, conf_map)
-                            .cpu()
-                            .numpy()
-                        )
-                    final_anomaly_maps_for_batch.append(anomaly_map_final)
-
-            # End timing
             if torch.cuda.is_available():
                 torch.cuda.synchronize(DEVICE)
-            end_time = time.perf_counter()
-            all_inference_times.append(end_time - start_time)
+            batch_elapsed = time.perf_counter() - start_time
+            per_image_time = batch_elapsed / max(1, len(path_batch))
 
-            for j, anomaly_map_final in enumerate(final_anomaly_maps_for_batch):
-                is_anomaly = is_anomaly_batch[j]
-                path = path_batch[j]
-                pil_img = pil_imgs[j]
-                if args.img_score_agg == "max":
-                    img_score = np.max(anomaly_map_final)
-                elif args.img_score_agg == "p99":
-                    img_score = np.percentile(anomaly_map_final, 99)
-                elif args.img_score_agg == "mtop5":
-                    img_score = np.mean(np.sort(anomaly_map_final.flatten())[-5:])
-                elif args.img_score_agg == "mtop1p":
-                    img_score = topk_mean(anomaly_map_final, frac=0.01)
-                else:
-                    img_score = np.mean(anomaly_map_final)
+            for j, (path, pil_img, anomaly_map, img_score) in enumerate(
+                zip(path_batch, pil_imgs, maps, batch_scores)
+            ):
+                gt_label = int(handler.get_image_label(path))
+                pred_label = int(img_score >= thr_img) if thr_img is not None else None
+                result_type = (
+                    _result_type(gt_label, pred_label) if pred_label is not None else "N/A"
+                )
 
-                img_true.append(1 if is_anomaly else 0)
-                img_pred_auroc.append(float(img_score))
-                if thr_img is not None:
-                    img_pred_f1.append(1 if img_score >= thr_img else 0)
+                img_true.append(gt_label)
+                img_scores.append(float(img_score))
+                if pred_label is not None:
+                    img_preds.append(pred_label)
+                category_times.append(per_image_time)
 
-                anomaly_map_normalized = min_max_norm(anomaly_map_final)
-                H, W = anomaly_map_normalized.shape
-                gt_path_str = handler.get_ground_truth_path(path)
-                if not gt_path_str or not os.path.exists(gt_path_str):
-                    gt_mask = np.zeros((H, W), dtype=np.uint8)
-                else:
-                    gt_mask_pil = Image.open(gt_path_str).convert("L")
-                    if args.docrop:
-                        resize_res = int(args.image_res / 0.875)
-                        gt_mask_pil = TF.resize(
-                            gt_mask_pil,
-                            (resize_res, resize_res),
-                            interpolation=TF.InterpolationMode.NEAREST,
-                        )
-                        gt_mask_pil = TF.center_crop(
-                            gt_mask_pil, (args.image_res, args.image_res)
-                        )
-                    gt_mask_pil = TF.resize(
-                        gt_mask_pil,
-                        (H, W),
-                        interpolation=TF.InterpolationMode.NEAREST,
+                anomaly_map_normalized = _normalize_anomaly_map_for_viz(
+                    anomaly_map,
+                    args,
+                )
+                heatmap_path = ""
+                if args.save_intro_overlays:
+                    heatmap_path = save_overlay_for_intro(
+                        path=path,
+                        img=pil_img,
+                        anom_map=anomaly_map_normalized,
+                        outdir=args.outdir,
+                        category=category,
+                        gt_label=gt_label,
+                        pred_label=pred_label,
+                        result_type=result_type,
+                        anomaly_score=float(img_score),
+                        threshold=thr_img,
                     )
-                    gt_mask = (np.array(gt_mask_pil) > 0).astype(np.uint8)
 
-                px_true_all.extend(gt_mask.flatten().astype(np.uint8))
-                px_pred_all_auroc.extend(anomaly_map_final.flatten().astype(np.float32))
-                px_pred_all_normalized.extend(
-                    anomaly_map_normalized.flatten().astype(np.float32)
+                if gt_label == 1 and vis_saved_count < args.vis_count:
+                    gt_mask = handler.get_ground_truth_mask(path, pil_img.size)
+                    saliency_for_viz = None
+                    if saliency_maps is not None:
+                        try:
+                            saliency_for_viz = saliency_maps[j]
+                        except Exception:
+                            saliency_for_viz = None
+                    save_visualization(
+                        path,
+                        pil_img,
+                        gt_mask,
+                        anomaly_map_normalized,
+                        args.outdir,
+                        category,
+                        vis_saved_count,
+                        saliency_mask=saliency_for_viz,
+                    )
+                    vis_saved_count += 1
+
+                image_results.append(
+                    {
+                        "category": category,
+                        "image_path": str(Path(path).resolve()),
+                        "defect_type": handler.get_defect_type(path),
+                        "gt_label": gt_label,
+                        "pred_label": pred_label if pred_label is not None else np.nan,
+                        "result_type": result_type,
+                        "anomaly_score": float(img_score),
+                        "threshold": float(thr_img) if thr_img is not None else np.nan,
+                        "inference_time": float(per_image_time),
+                        "heatmap_path": heatmap_path,
+                    }
                 )
 
-                pro_gt_masks.append(gt_mask)
-                pro_anomaly_maps.append(anomaly_map_final.astype(np.float32))
+        y_true = np.asarray(img_true, dtype=np.int64)
+        y_score = np.asarray(img_scores, dtype=np.float64)
+        if thr_img is not None:
+            y_pred = np.asarray(img_preds, dtype=np.int64)
+        else:
+            y_pred = np.array([], dtype=np.int64)
 
-                if is_anomaly:
-                    if args.save_intro_overlays:
-                        vis_img = pil_img
-                        save_overlay_for_intro(
-                            path,
-                            vis_img,
-                            anomaly_map_normalized,
-                            args.outdir,
-                            category,
-                        )
-                    if vis_saved_count < args.vis_count:
-                        vis_img = pil_img
-                        if args.docrop and not args.patch_size:
-                            resize_res = int(args.image_res / 0.875)
-                            vis_img = TF.resize(
-                                vis_img,
-                                (resize_res, resize_res),
-                                interpolation=TF.InterpolationMode.BICUBIC,
-                            )
-                            vis_img = TF.center_crop(
-                                vis_img, (args.image_res, args.image_res)
-                            )
-                        saliency_map_for_viz = None
-                        raw_mask_map = None
-                        if saliency_maps_for_viz_batch is not None:
-                            raw_mask_map = saliency_maps_for_viz_batch[j]
+        if thr_img is not None and len(y_true) == len(y_pred):
+            tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+            tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+            fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+            fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+        else:
+            tp = tn = fp = fn = 0
 
-                        if raw_mask_map is not None:
-                            try:
-                                if args.bg_mask_method == "pca_normality":
-                                    binary_mask = raw_mask_map
-
-                                elif args.bg_mask_method == "dino_saliency":
-                                    if args.mask_threshold_method == "percentile":
-                                        threshold_val = np.percentile(
-                                            raw_mask_map,
-                                            args.percentile_threshold * 100,
-                                        )
-                                        binary_mask = (
-                                            raw_mask_map >= threshold_val
-                                        ).astype(np.float32)
-                                    else:  # otsu
-                                        norm_mask = cv2.normalize(
-                                            raw_mask_map,
-                                            None,
-                                            0,
-                                            255,
-                                            cv2.NORM_MINMAX,
-                                            dtype=cv2.CV_8U,
-                                        )
-                                        _, binary_mask_u8 = cv2.threshold(
-                                            norm_mask,
-                                            0,
-                                            255,
-                                            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                                        )
-                                        binary_mask = (binary_mask_u8 > 0).astype(
-                                            np.float32
-                                        )
-                                saliency_map_for_viz = post_process_map(
-                                    binary_mask,
-                                    anomaly_map_normalized.shape,
-                                    blur=False,
-                                )
-                            except Exception as e:
-                                logging.warning(
-                                    f"Saliency mask processing failed for visualization: {e}."
-                                )
-
-                        save_visualization(
-                            path,
-                            vis_img,
-                            gt_mask,
-                            anomaly_map_normalized,
-                            args.outdir,
-                            category,
-                            vis_saved_count,
-                            saliency_mask=saliency_map_for_viz,
-                        )
-                        vis_saved_count += 1
-
-            test_iter.update(len(path_batch))
-        if all_inference_times:
-            times_arr = np.array(all_inference_times)
-            total_images_processed = len(test_paths)
-            total_time = np.sum(times_arr)
-
-            avg_time_per_image = total_time / total_images_processed
-            images_per_second = 1.0 / avg_time_per_image
-
-            logging.info(f"--- Timing Results for {category} ---")
-            logging.info(f"Total test images: {total_images_processed}")
-            logging.info(
-                f"Batch size: {args.batch_size} (Processed {len(all_inference_times)} batches)"
-            )
-            logging.info(f"Total inference time: {total_time:.4f} s")
-            logging.info(f"Avg. time per image: {avg_time_per_image:.6f} s")
-            logging.info(f"Images per second (FPS): {images_per_second:.2f}")
-
-            # Report batch stats
-            if len(times_arr) > 1:
-                times_arr_stats = times_arr[1:]
-                logging.info(
-                    f"Avg. time per batch (excl. 1st): {np.mean(times_arr_stats):.6f} s"
-                )
-                logging.info(
-                    f"Median time per batch (excl. 1st): {np.median(times_arr_stats):.6f} s"
-                )
-            else:
-                logging.info(f"Avg. time per batch: {np.mean(times_arr):.6f} s")
+        fpr = _safe_ratio(fp, fp + tn)
+        fnr = _safe_ratio(fn, fn + tp)
         img_auroc = (
-            roc_auc_score(img_true, img_pred_auroc)
-            if len(np.unique(img_true)) > 1
+            float(roc_auc_score(y_true, y_score))
+            if y_true.size > 0 and len(np.unique(y_true)) > 1
             else np.nan
         )
-
         img_aupr = (
-            average_precision_score(img_true, img_pred_auroc)
-            if len(np.unique(img_true)) > 1
+            float(average_precision_score(y_true, y_score))
+            if y_true.size > 0 and len(np.unique(y_true)) > 1
             else np.nan
+        )
+        img_f1 = (
+            float(f1_score(y_true, y_pred, zero_division=0))
+            if thr_img is not None and (y_true == 1).any()
+            else np.nan
+        )
+        avg_inference_time = (
+            float(np.mean(category_times)) if category_times else np.nan
         )
 
-        px_true_arr = np.array(px_true_all, dtype=np.uint8)
-        px_pred_arr_auroc = np.array(px_pred_all_auroc)
-        px_pred_arr_normalized = np.array(px_pred_all_normalized)
-        has_pos = (px_true_arr == 1).any()
-        has_neg = (px_true_arr == 0).any()
-        px_auroc = (
-            roc_auc_score(px_true_arr, px_pred_arr_auroc)
-            if (has_pos and has_neg)
-            else np.nan
+        category_results.append(
+            {
+                "category": category,
+                "pca_dim": actual_pca_dim,
+                "threshold": float(thr_img) if thr_img is not None else np.nan,
+                "TP": tp,
+                "TN": tn,
+                "FP": fp,
+                "FN": fn,
+                "fpr": fpr,
+                "fnr": fnr,
+                "Image_AUROC": img_auroc,
+                "Image_AUPR": img_aupr,
+                "Image_F1": img_f1,
+                "Avg_Inference_time": avg_inference_time,
+            }
         )
-        img_f1 = f1_score(img_true, img_pred_f1) if (thr_img is not None) else np.nan
-        if thr_px is not None and has_pos:
-            px_f1 = f1_score(
-                px_true_arr.astype(int),
-                (px_pred_arr_normalized >= thr_px).astype(int),
-            )
-        else:
-            px_f1 = np.nan
-        if len(pro_gt_masks) > 0 and any(mask.any() for mask in pro_gt_masks):
-            fpr_cap = getattr(args, "pro_integration_limit", 0.3)
-            au_pro = compute_aupro(
-                pro_anomaly_maps,
-                pro_gt_masks,
-                fpr_limit=fpr_cap,
-                num_thresholds=300,
-                connectivity=8,
-            )
-        else:
-            logging.warning(
-                f"No anomalous ground-truth regions found in test set for {category}. "
-                "AUPRO is not computable."
-            )
-            au_pro = np.nan
+
         logging.info(
-            f"{category} Results | I-AUROC: {img_auroc:.4f} | I-AUPR: {img_aupr:.4f} | "
-            f"P-AUROC: {px_auroc:.4f} | AU-PRO: {au_pro:.4f} | "
-            f"I-F1: {img_f1:.4f} | P-F1: {px_f1:.4f}"
-        )
-        all_results.append(
-            [category, args.seed, img_auroc, img_aupr, px_auroc, au_pro, img_f1, px_f1]
+            "%s | PCA=%s | thr=%s | TP=%d TN=%d FP=%d FN=%d | "
+            "FPR=%s FNR=%s | AUROC=%s AUPR=%s F1=%s | avg=%.6fs",
+            category,
+            actual_pca_dim,
+            f"{thr_img:.6f}" if thr_img is not None else "N/A",
+            tp,
+            tn,
+            fp,
+            fn,
+            f"{fpr:.4f}" if np.isfinite(fpr) else "N/A",
+            f"{fnr:.4f}" if np.isfinite(fnr) else "N/A",
+            f"{img_auroc:.4f}" if np.isfinite(img_auroc) else "N/A",
+            f"{img_aupr:.4f}" if np.isfinite(img_aupr) else "N/A",
+            f"{img_f1:.4f}" if np.isfinite(img_f1) else "N/A",
+            avg_inference_time if np.isfinite(avg_inference_time) else float("nan"),
         )
 
-    df = pd.DataFrame(
-        all_results,
-        columns=[
-            "Category",
-            "Seed",
-            "Image AUROC",
-            "Image AUPR",
-            "Pixel AUROC",
-            "AU-PRO",
-            "Image F1",
-            "Pixel F1",
-        ],
+        _write_csvs(
+            args.outdir,
+            category_results,
+            dataset_counts,
+            image_results,
+            validation_results,
+        )
+
+    category_df, counts_df, _, validation_df = _write_csvs(
+        args.outdir,
+        category_results,
+        dataset_counts,
+        image_results,
+        validation_results,
+        final=True,
     )
-    if not df.empty and len(df) > 1:
-        mean_values = df.mean(numeric_only=True)
-        mean_row = pd.DataFrame(
-            [["Average"] + mean_values.tolist()], columns=df.columns
-        )
-        df = pd.concat([df, mean_row], ignore_index=True)
-
-    logging.info("\n--- Benchmark Final Results ---")
-    logging.info("\n" + df.to_string(index=False, float_format="%.4f", na_rep="N/A"))
-
-    results_path = os.path.join(args.outdir, "benchmark_results.csv")
-    df.to_csv(results_path, index=False, float_format="%.4f")
-    logging.info(f"\nResults saved to {results_path}")
+    logging.info("\n--- Final Category Results ---\n%s", category_df.to_string(index=False, na_rep="N/A"))
+    logging.info("\n--- Dataset Counts ---\n%s", counts_df.to_string(index=False))
+    logging.info(
+        "Saved %d validation image scores to validation_results.csv",
+        len(validation_df),
+    )
+    logging.info("Results saved under: %s", args.outdir)
 
 
 if __name__ == "__main__":

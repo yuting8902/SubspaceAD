@@ -1,23 +1,53 @@
 import argparse
+import os
 
 
 def parse_layer_indices(arg_str: str):
-    """Parses a comma-separated string of integers."""
+    """Parse a comma-separated list of integer layer indices."""
     return [int(x.strip()) for x in arg_str.split(",")]
 
 
 def parse_grouped_layers(arg_str: str):
-    """Parses grouped layer indices from format like '-1,-2:-3,-4'."""
+    """Parse grouped layers such as '-1,-2:-3,-4'."""
     if not arg_str:
         return []
     return [parse_layer_indices(group) for group in arg_str.split(":")]
 
 
+def _validate_wafer_roots(parser: argparse.ArgumentParser, args):
+    """Validate custom wafer roots while keeping main.py compatible."""
+    if args.dataset_name != "wafer":
+        if not args.dataset_path:
+            parser.error("--dataset_path is required for non-wafer datasets.")
+        return args
+
+    if not args.train_root:
+        parser.error("--train_root is required when --dataset_name wafer.")
+    if not args.test_root:
+        parser.error("--test_root is required when --dataset_name wafer.")
+
+    # Official main.py discovers categories from args.dataset_path and passes that
+    # value to get_dataset_handler(). Point it at train_root for compatibility.
+    args.dataset_path = args.train_root
+
+    # The official get_dataset_handler() signature only receives one root path.
+    # Store the additional split roots in process-local environment variables so
+    # datasets.py can retrieve them without changing official main.py.
+    os.environ["SUBSPACEAD_WAFER_TRAIN_ROOT"] = os.path.abspath(args.train_root)
+    os.environ["SUBSPACEAD_WAFER_TEST_ROOT"] = os.path.abspath(args.test_root)
+    if args.val_root:
+        os.environ["SUBSPACEAD_WAFER_VAL_ROOT"] = os.path.abspath(args.val_root)
+    else:
+        os.environ.pop("SUBSPACEAD_WAFER_VAL_ROOT", None)
+
+    return args
+
+
 def get_args():
-    """Parses and returns command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Unified Anomaly Detection Benchmark Framework"
+        description="SubspaceAD anomaly detection benchmark"
     )
+
     data_group = parser.add_argument_group("Dataset Arguments")
     model_group = parser.add_argument_group("Model & Feature Extraction Arguments")
     aug_group = parser.add_argument_group("Augmentation Arguments (for k-shot)")
@@ -27,242 +57,328 @@ def get_args():
     specular_group = parser.add_argument_group("Specular Reflection Filter Arguments")
     log_group = parser.add_argument_group("Logistics")
 
-    data_group.add_argument(
-        "--seed", type=int, default=42, help="Random seed for reproducibility."
-    )
+    # ---------------- Dataset ----------------
+    data_group.add_argument("--seed", type=int, default=42)
     data_group.add_argument(
         "--dataset_name",
         type=str,
         required=True,
-        choices=["mvtec_ad", "mvtec_ad2", "visa"],
-        help="Name of the dataset to use.",
+        choices=["mvtec_ad", "mvtec_loco", "mvtec_ad2", "visa", "wafer"],
     )
     data_group.add_argument(
-        "--dataset_path", type=str, required=True, help="Root path to the dataset."
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="Root path for original datasets. Not needed for --dataset_name wafer.",
+    )
+    data_group.add_argument(
+        "--train_root",
+        type=str,
+        default=None,
+        help="Wafer training root: <train_root>/<category>/train/good/.",
+    )
+    data_group.add_argument(
+        "--val_root",
+        type=str,
+        default=None,
+        help="Wafer validation root: <val_root>/<category>/val/good/. Optional.",
+    )
+    data_group.add_argument(
+        "--test_root",
+        type=str,
+        default=None,
+        help="Wafer test root: <test_root>/<category>/test/<type>/.",
     )
     data_group.add_argument(
         "--categories",
         type=str,
         nargs="+",
         default=None,
-        help="Specify categories to run, e.g., 'bottle screw'. If None, runs all.",
+        help="Categories to run. If omitted, categories are discovered from train_root/dataset_path.",
+    )
+
+    # ---------------- Backbone / features ----------------
+    model_group.add_argument(
+        "--feature_source",
+        type=str,
+        default="dinov2",
+        choices=["dinov2", "anomalyvfm"],
+        help=(
+            "Feature extractor source. 'dinov2' keeps the completed H0 Hugging "
+            "Face extractor; 'anomalyvfm' uses the Meta/AnomalyVFM extractor."
+        ),
+    )
+    model_group.add_argument(
+        "--anomalyvfm_variant",
+        type=str,
+        default="a1_adapted_final",
+        choices=[
+            "a0_original_final",
+            "a1_adapted_final",
+            "a2_adapted_middle",
+        ],
+        help=(
+            "Ablation used only when --feature_source anomalyvfm. "
+            "a0_original_final: Meta DINOv2-L/14-Reg original final normalized "
+            "patch tokens, no DoRA; "
+            "a1_adapted_final: H1, AnomalyVFM DoRA-adapted final "
+            "x_norm_patchtokens; "
+            "a2_adapted_middle: AnomalyVFM DoRA-adapted selected middle layers, "
+            "normalized per layer and mean-aggregated."
+        ),
     )
     model_group.add_argument(
         "--model_ckpt",
         type=str,
         default="facebook/dinov2-with-registers-large",
-        help="HuggingFace model checkpoint for feature extraction.",
+        help="Hugging Face model directory/checkpoint. For offline H0, pass the local DINOv2-L/14-Reg folder.",
     )
     model_group.add_argument(
-        "--image_res", type=int, default=256, help="Image resolution for the model."
+        "--anomalyvfm_root",
+        type=str,
+        default="/workspace/Venessa/AnomalyVFM_",
+        help=(
+            "Local AnomalyVFM_ root. It must contain "
+            "models/dinov2_offline.py and peft_local/."
+        ),
     )
     model_group.add_argument(
-        "--patch_size",
-        type=int,
-        default=None,
-        help="Size of the square patches. If None, process in full resolution.",
+        "--anomalyvfm_ckpt",
+        type=str,
+        default="/workspace/Venessa/AnomalyVFM_/pretrained_models/anomalyvfm_dinov2.pkl",
+        help="Local AnomalyVFM DINOv2 trained checkpoint used by A1/A2.",
     )
     model_group.add_argument(
-        "--patch_overlap",
-        type=float,
-        default=0.0,
-        help="Overlap ratio between patches.",
+        "--dino_repo_path",
+        type=str,
+        default="/workspace/Venessa/dinov2",
+        help="Local official facebookresearch/dinov2 repository used by A0/A1/A2.",
     )
     model_group.add_argument(
-        "--batch_size", type=int, default=1, help="Batch size for feature extraction."
+        "--dino_weight_path",
+        type=str,
+        default="/workspace/model_weight/dinov2_vitl14_reg4_pretrain.pth",
+        help="Local official DINOv2 ViT-L/14-register pretrained .pth.",
     )
+    model_group.add_argument("--image_res", type=int, default=256)
+    model_group.add_argument("--patch_size", type=int, default=None)
+    model_group.add_argument("--patch_overlap", type=float, default=0.0)
+    model_group.add_argument("--batch_size", type=int, default=1)
     model_group.add_argument(
         "--k_shot",
         type=int,
         default=None,
-        help="Number of 'good' training images to use (k-shot). If None, all are used.",
+        help="Number of normal training images to use. Omit to use all training images.",
     )
     model_group.add_argument(
         "--agg_method",
         type=str,
         default="mean",
         choices=["concat", "mean", "group"],
-        help="Feature aggregation method across layers.",
     )
     model_group.add_argument(
         "--layers",
         type=str,
         default="-12,-13,-14,-15,-16,-17,-18",
-        help="Comma-separated layer indices for 'concat' or 'mean' aggregation.",
     )
-    model_group.add_argument(
-        "--grouped_layers",
-        type=str,
-        default=None,
-        help="Layer groups for 'group' agg. Format: '-1,-2:-3,-4'.",
-    )
-    model_group.add_argument(
-        "--docrop",
-        action="store_true",
-        help="Apply center cropping during preprocessing.",
-    )
-    model_group.add_argument(
-        "--use_clahe",
-        action="store_true",
-        help="Apply CLAHE to the images.",
-    )
+    model_group.add_argument("--grouped_layers", type=str, default=None)
+    model_group.add_argument("--docrop", action="store_true")
+    model_group.add_argument("--use_clahe", action="store_true")
 
-    aug_group.add_argument(
-        "--aug_count",
-        type=int,
-        default=0,
-        help="Number of augmented samples to generate per k-shot image. Only active if --k_shot is set.",
-    )
+    # ---------------- Augmentation ----------------
+    aug_group.add_argument("--aug_count", type=int, default=0)
     aug_group.add_argument(
         "--aug_list",
         type=str,
         nargs="+",
         default=["rotate"],
-        help="List of augmentations to apply. Choices: hflip, vflip, rotate, color_jitter, affine.",
+        help="Choices supported by transforms.py include hflip, vflip, rotate, color_jitter, affine.",
     )
     aug_group.add_argument(
         "--no_aug_categories",
         type=str,
         nargs="+",
         default=["transistor"],
-        help="List of categories for which augmentations should be disabled.",
     )
 
-    pca_group.add_argument(
-        "--pca_dim",
-        type=int,
-        default=None,
-        help="Number of principal components to keep. Overrides --pca_ev.",
-    )
-    pca_group.add_argument(
-        "--pca_ev",
-        type=float,
-        default=0.99,
-        help="Explained variance to retain for PCA. Used if --pca_dim is None.",
-    )
-    pca_group.add_argument(
-        "--whiten", action="store_true", help="Apply whitening in PCA."
-    )
-    pca_group.add_argument(
-        "--use_kernel_pca",
-        action="store_true",
-        help="Use Kernel PCA instead of standard PCA.",
-    )
+    # ---------------- PCA ----------------
+    pca_group.add_argument("--pca_dim", type=int, default=None)
+    pca_group.add_argument("--pca_ev", type=float, default=0.99)
+    pca_group.add_argument("--whiten", action="store_true")
+    pca_group.add_argument("--use_kernel_pca", action="store_true")
     pca_group.add_argument(
         "--kernel_pca_kernel",
         type=str,
         default="rbf",
         choices=["rbf", "linear", "poly", "sigmoid", "cosine"],
-        help="Kernel to use for Kernel PCA.",
     )
-    pca_group.add_argument(
-        "--kernel_pca_gamma",
-        type=float,
-        default=None,
-        help="Gamma for rbf, poly and sigmoid kernels. If None, it's set to 1/n_features.",
-    )
+    pca_group.add_argument("--kernel_pca_gamma", type=float, default=None)
+
+    # ---------------- Score / evaluation ----------------
     score_group.add_argument(
         "--score_method",
         type=str,
         default="reconstruction",
         choices=["reconstruction", "mahalanobis", "cosine", "euclidean"],
-        help="Anomaly scoring method.",
     )
-    score_group.add_argument(
-        "--drop_k",
-        type=int,
-        default=0,
-        help="Number of initial principal components to drop during reconstruction scoring.",
-    )
+    score_group.add_argument("--drop_k", type=int, default=0)
     score_group.add_argument(
         "--img_score_agg",
         type=str,
         default="mtop1p",
         choices=["max", "mean", "p99", "mtop5", "mtop1p"],
-        help="Aggregation for image-level scores from pixel maps.",
+    )
+    score_group.add_argument("--pro_integration_limit", type=float, default=0.3)
+    score_group.add_argument(
+        "--target_img_fpr",
+        type=float,
+        default=0.05,
+        help="When validation contains only normal images, choose the image threshold at this target validation FPR.",
     )
     score_group.add_argument(
-        "--pro_integration_limit",
+        "--target_px_fpr",
         type=float,
-        default=0.3,
-        help="Integration limit for AU-PRO calculation.",
+        default=0.05,
+        help="Pixel fallback FPR. Not meaningful for the wafer dataset because no GT masks are supplied.",
     )
+    score_group.add_argument(
+        "--use_d1_denoise",
+        action="store_true",
+        help=(
+            "Enable D1 local-contrast denoising on the raw patch anomaly map "
+            "before the existing SubspaceAD post_process_map()."
+        ),
+    )
+    score_group.add_argument(
+        "--d1_sigma",
+        type=float,
+        default=4.0,
+        help=(
+            "D1 Gaussian sigma on the raw patch anomaly map. Larger values "
+            "estimate a broader low-frequency illumination background."
+        ),
+    )
+    score_group.add_argument(
+        "--d1_alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "D1 background subtraction strength in [0,1]. "
+            "0 disables subtraction; 1 subtracts the full estimated background."
+        ),
+    )
+    score_group.add_argument(
+        "--d1_lambda",
+        type=float,
+        default=0.5,
+        help=(
+            "D1 blend strength in [0,1]. 0 keeps the original anomaly map; "
+            "1 uses only the local-contrast residual."
+        ),
+    )
+    score_group.add_argument(
+        "--use_d2_denoise",
+        action="store_true",
+        help=(
+            "Enable D2 spatial-coherence soft suppression on the raw patch "
+            "anomaly map. If D1 is also enabled, D2 runs after D1."
+        ),
+    )
+    score_group.add_argument(
+        "--d2_percentile",
+        type=float,
+        default=95.0,
+        help=(
+            "D2 high-score candidate percentile over positive patch scores. "
+            "95 analyzes roughly the strongest 5 percent of positive scores."
+        ),
+    )
+    score_group.add_argument(
+        "--d2_grid_size",
+        type=int,
+        default=6,
+        help=(
+            "D2 spatial-entropy grid size per axis. For a 48x48 H1 map, "
+            "6 creates a 6x6 analysis grid."
+        ),
+    )
+    score_group.add_argument(
+        "--d2_lambda",
+        type=float,
+        default=0.5,
+        help=(
+            "D2 suppression strength in [0,1]. Larger values more strongly "
+            "reduce spatially dispersed high-score regions."
+        ),
+    )
+    score_group.add_argument(
+        "--d2_min_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "D2 safety floor in [0,1]. Secondary candidate regions are never "
+            "multiplied by less than this weight; the strongest region is "
+            "protected even more."
+        ),
+    )
+
+    # ---------------- Background mask ----------------
     mask_group.add_argument(
         "--bg_mask_method",
         type=str,
         default=None,
-        choices=[None, "dino_saliency", "pca_normality"],
-        help="Method to use for background masking.",
+        choices=["dino_saliency", "pca_normality"],
     )
     mask_group.add_argument(
         "--mask_threshold_method",
         type=str,
         default="percentile",
         choices=["percentile", "otsu"],
-        help="How to binarize the saliency/normality map.",
     )
-    mask_group.add_argument(
-        "--percentile_threshold",
-        type=float,
-        default=0.15,
-        help="Percentile threshold (0.0-1.0) for 'percentile' method.",
-    )
-    mask_group.add_argument(
-        "--dino_saliency_layer",
-        type=int,
-        default=6,
-        help="Which transformer layer's attention to use for 'dino_saliency' mask (0-indexed).",
-    )
+    mask_group.add_argument("--percentile_threshold", type=float, default=0.15)
+    mask_group.add_argument("--dino_saliency_layer", type=int, default=6)
+
+    # ---------------- Specular filter ----------------
+    specular_group.add_argument("--use_specular_filter", action="store_true")
+    specular_group.add_argument("--specular_tau", type=float, default=0.6)
     specular_group.add_argument(
-        "--use_specular_filter",
-        action="store_true",
-        help="Enable the specular reflection filter as a post-processing step.",
-    )
-    specular_group.add_argument(
-        "--specular_tau",
-        type=float,
-        default=0.6,
-        help="Binarization threshold for the specular mask.",
-    )
-    specular_group.add_argument(
-        "--specular_size_threshold_factor",
-        type=float,
-        default=1.5,
-        help="Size threshold factor for filtering specular anomalies.",
-    )
-    log_group.add_argument(
-        "--outdir",
-        type=str,
-        default="./results_full_shot",
-        help="Directory to save results, logs, and visualizations.",
-    )
-    log_group.add_argument(
-        "--vis_count",
-        type=int,
-        default=0,
-        help="Number of anomalous examples to visualize per category.",
-    )
-    log_group.add_argument(
-        "--save_intro_overlays",
-        action="store_true",
-        help="Save clean overlay images for the introductory figure.",
-    )
-    log_group.add_argument(
-        "--no_log_file",
-        action="store_true",
-        help="Do not save a log file to the output directory.",
-    )
-    log_group.add_argument(
-        "--debug_limit",
-        type=int,
-        default=None,
-        help="Run in debug mode on a subset of N images.",
-    )
-    log_group.add_argument(
-        "--batched_zero_shot",
-        action="store_true",
-        help="Run in batched zero-shot mode, fitting PCA on the test set.",
+        "--specular_size_threshold_factor", type=float, default=1.5
     )
 
+    # ---------------- Output / debug ----------------
+    log_group.add_argument("--outdir", type=str, default="./results_full_shot")
+    log_group.add_argument("--vis_count", type=int, default=0)
+    log_group.add_argument("--save_intro_overlays", action="store_true")
+    log_group.add_argument(
+        "--fixed_heatmap_scale",
+        action="store_true",
+        help=(
+            "Use one fixed anomaly-score-to-color scale for all saved heatmaps "
+            "instead of per-image min-max normalization."
+        ),
+    )
+    log_group.add_argument(
+        "--fixed_heatmap_vmin",
+        type=float,
+        default=0.0,
+        help=(
+            "Raw anomaly-map value mapped to heatmap value 0 (blue) when "
+            "--fixed_heatmap_scale is enabled."
+        ),
+    )
+    log_group.add_argument(
+        "--fixed_heatmap_vmax",
+        type=float,
+        default=None,
+        help=(
+            "Raw anomaly-map value mapped to heatmap value 1 (red) when "
+            "--fixed_heatmap_scale is enabled. Use the same value for "
+            "Baseline, D1 and D2 when comparing heatmaps."
+        ),
+    )
+    log_group.add_argument("--no_log_file", action="store_true")
+    log_group.add_argument("--debug_limit", type=int, default=None)
+    log_group.add_argument("--batched_zero_shot", action="store_true")
+
     args = parser.parse_args()
-    return args
+    return _validate_wafer_roots(parser, args)

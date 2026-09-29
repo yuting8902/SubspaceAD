@@ -1,55 +1,86 @@
 import logging
-import torch
-from transformers import AutoImageProcessor, AutoModel
+import os
+
 import cv2
 import numpy as np
+import torch
 from PIL import Image
+from transformers import AutoImageProcessor, AutoModel
+
+
+# Force Hugging Face / Transformers into offline mode. The user supplies a local
+# directory containing config.json, model.safetensors and preprocessor_config.json.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class FeatureExtractor:
-    """Encapsulates the feature extraction model and logic."""
+    """DINOv2 feature extraction interface used by SubspaceAD."""
 
     def __init__(self, model_ckpt: str):
-        logging.info(f"Loading feature extraction model: {model_ckpt}...")
-        self.processor = AutoImageProcessor.from_pretrained(model_ckpt)
-        self.model = AutoModel.from_pretrained(model_ckpt).eval().to(DEVICE)
+        if not os.path.isdir(model_ckpt):
+            raise FileNotFoundError(
+                f"Offline model directory not found: {model_ckpt}\n"
+                "Expected a local DINOv2 folder containing config.json, "
+                "model.safetensors and preprocessor_config.json."
+            )
+
+        logging.info("Loading local feature extraction model: %s", model_ckpt)
+        self.processor = AutoImageProcessor.from_pretrained(
+            model_ckpt,
+            local_files_only=True,
+        )
+        self.model = AutoModel.from_pretrained(
+            model_ckpt,
+            local_files_only=True,
+        ).eval().to(DEVICE)
+
         try:
             self.model.set_attn_implementation("eager")
-            logging.info("Set model attention implementation to 'eager'.")
+            logging.info("Using eager attention so attention maps are available.")
         except AttributeError:
             logging.warning(
-                "Could not set attention implementation. Saliency masking might fail."
+                "This Transformers model does not expose set_attn_implementation(). "
+                "DINO saliency may be unavailable."
             )
-        logging.info("Model loaded successfully.")
+
+        cfg = self.model.config
+        logging.info(
+            "Local model loaded: hidden_size=%s, patch_size=%s, num_hidden_layers=%s, num_register_tokens=%s",
+            getattr(cfg, "hidden_size", "unknown"),
+            getattr(cfg, "patch_size", "unknown"),
+            getattr(cfg, "num_hidden_layers", "unknown"),
+            getattr(cfg, "num_register_tokens", 0),
+        )
 
     def _apply_clahe(self, pil_imgs: list) -> list:
-        """Applies CLAHE to a list of PIL images."""
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        processed_imgs = []
+        processed = []
         for img in pil_imgs:
-            img_np = np.array(img)
-            img_lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
-            l_, a, b = cv2.split(img_lab)
-            l_clahe = clahe.apply(l_)
-            img_lab_clahe = cv2.merge((l_clahe, a, b))
-            img_rgb_clahe = cv2.cvtColor(img_lab_clahe, cv2.COLOR_LAB2RGB)
-            processed_imgs.append(Image.fromarray(img_rgb_clahe))
-        return processed_imgs
+            rgb = np.asarray(img)
+            lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+            l_channel = clahe.apply(l_channel)
+            merged = cv2.merge((l_channel, a_channel, b_channel))
+            processed.append(Image.fromarray(cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)))
+        return processed
 
+    @staticmethod
     def _spatial_from_seq(
-        self,
         seq_tokens: torch.Tensor,
         drop_front: int,
         n_expected: int,
         h_p: int,
         w_p: int,
     ) -> torch.Tensor:
-        """Converts a sequence of tokens to a spatial (grid) format."""
-        B, N, C = seq_tokens.shape
-        tokens = seq_tokens[:, drop_front : drop_front + n_expected, :]
-        return tokens.reshape(B, h_p, w_p, C)
+        patch_tokens = seq_tokens[:, drop_front : drop_front + n_expected, :]
+        if patch_tokens.shape[1] != n_expected:
+            raise ValueError(
+                f"Expected {n_expected} patch tokens but got {patch_tokens.shape[1]}."
+            )
+        return patch_tokens.reshape(seq_tokens.shape[0], h_p, w_p, seq_tokens.shape[-1])
 
     def _get_saliency_mask(
         self,
@@ -62,30 +93,34 @@ class FeatureExtractor:
         h_p: int,
         w_p: int,
     ) -> np.ndarray:
-        """Extracts the DINO saliency mask from attention weights."""
-        if dino_saliency_layer < 0:
-            dino_saliency_layer = len(attentions) + dino_saliency_layer
-
-        if dino_saliency_layer >= len(attentions):
-            logging.warning(
-                f"DINO saliency layer {dino_saliency_layer} is out of bounds (0-{len(attentions)-1}). Defaulting to 0."
+        if attentions is None:
+            raise ValueError(
+                "Attention weights were not returned. Check Transformers compatibility "
+                "or use an eager attention implementation."
             )
-            dino_saliency_layer = 0
 
-        attn_map = attentions[dino_saliency_layer]
+        layer = dino_saliency_layer
+        if layer < 0:
+            layer += len(attentions)
+        if layer < 0 or layer >= len(attentions):
+            logging.warning(
+                "DINO saliency layer %s is outside [0, %s]; using layer 0.",
+                dino_saliency_layer,
+                len(attentions) - 1,
+            )
+            layer = 0
+
+        attn = attentions[layer]
+        patch_slice = slice(drop_front, drop_front + n_expected)
+
         if num_reg > 0:
-            reg_attn_to_patches = attn_map[
-                :, :, 1:drop_front, drop_front : drop_front + n_expected
-            ]
-            saliency_mask = reg_attn_to_patches.mean(dim=(1, 2))
+            # Average attention from all register tokens to all patch tokens.
+            saliency = attn[:, :, 1:drop_front, patch_slice].mean(dim=(1, 2))
         else:
-            logging.info("No register tokens found. Using CLS token for saliency mask.")
-            cls_attn_to_patches = attn_map[
-                :, :, 0, drop_front : drop_front + n_expected
-            ]
-            saliency_mask = cls_attn_to_patches.mean(dim=1)
+            # Fallback for DINO-style checkpoints without registers.
+            saliency = attn[:, :, 0, patch_slice].mean(dim=1)
 
-        return saliency_mask.reshape(batch_size, h_p, w_p).cpu().numpy()
+        return saliency.reshape(batch_size, h_p, w_p).detach().cpu().numpy()
 
     def _aggregate_layers(
         self,
@@ -98,40 +133,29 @@ class FeatureExtractor:
         h_p: int,
         w_p: int,
     ) -> np.ndarray:
-        """Aggregates features from specified layers."""
-
-        _spatial_converter = lambda x: self._spatial_from_seq(
-            x, drop_front, n_expected, h_p, w_p
-        )
+        def convert(index):
+            return self._spatial_from_seq(
+                hidden_states[index], drop_front, n_expected, h_p, w_p
+            )
 
         if agg_method == "group":
             if not grouped_layers:
-                raise ValueError(
-                    "Grouped layers must be provided for 'group' aggregation."
-                )
-
-            all_layer_indices = sorted(
-                list(set(idx for group in grouped_layers for idx in group))
-            )
-            layer_tensors = {
-                li: _spatial_converter(hidden_states[li]) for li in all_layer_indices
-            }
-            fused_groups = [
-                torch.stack([layer_tensors[li] for li in group], dim=0).mean(dim=0)
+                raise ValueError("--grouped_layers is required when --agg_method group.")
+            groups = [
+                torch.stack([convert(index) for index in group], dim=0).mean(dim=0)
                 for group in grouped_layers
             ]
-            fused = torch.cat(fused_groups, dim=-1)
-
+            fused = torch.cat(groups, dim=-1)
         else:
-            feats = [_spatial_converter(hidden_states[li]) for li in layers]
-            if agg_method == "concat":
-                fused = torch.cat(feats, dim=-1)
-            elif agg_method == "mean":
-                fused = torch.stack(feats, dim=0).mean(dim=0)
+            features = [convert(index) for index in layers]
+            if agg_method == "mean":
+                fused = torch.stack(features, dim=0).mean(dim=0)
+            elif agg_method == "concat":
+                fused = torch.cat(features, dim=-1)
             else:
-                raise ValueError(f"Unknown aggregation method: '{agg_method}'")
+                raise ValueError(f"Unknown aggregation method: {agg_method}")
 
-        return fused.cpu().numpy()
+        return fused.detach().cpu().numpy()
 
     @torch.no_grad()
     def extract_tokens(
@@ -140,32 +164,23 @@ class FeatureExtractor:
         res: int,
         layers: list,
         agg_method: str,
-        grouped_layers: list = [],
+        grouped_layers: list = None,
         docrop: bool = False,
         use_clahe: bool = False,
         dino_saliency_layer: int = 0,
     ):
-        """
-        Extracts, aggregates features, and computes saliency from a batch of images.
+        grouped_layers = grouped_layers or []
 
-        Returns:
-            - fused_tokens (np.ndarray): The aggregated patch features.
-            - grid_size (tuple): The (height, width) of the patch grid.
-            - saliency_mask (np.ndarray): The DINO saliency mask.
-        """
-
-        # 1. Preprocessing
         if use_clahe:
             pil_imgs = self._apply_clahe(pil_imgs)
 
         if docrop:
             resize_res = int(res / 0.875)
             size = {"height": resize_res, "width": resize_res}
-            crop_size = {"height": res, "width": res}
         else:
             size = {"height": res, "width": res}
-            crop_size = {"height": res, "width": res}
 
+        crop_size = {"height": res, "width": res}
         inputs = self.processor(
             images=pil_imgs,
             return_tensors="pt",
@@ -175,31 +190,23 @@ class FeatureExtractor:
             crop_size=crop_size,
         ).to(DEVICE)
 
-        # 2. Model Inference
         outputs = self.model(
-            **inputs, output_hidden_states=True, output_attentions=True
+            **inputs,
+            output_hidden_states=True,
+            output_attentions=True,
         )
-        hidden_states = outputs.hidden_states
-        attentions = outputs.attentions
 
-        if attentions is None:
-            raise ValueError(
-                "Attention weights are None. Model may be using Flash Attention. "
-                "Check transformers version or model compatibility."
-            )
-
-        # 3. Setup Parameters
         cfg = self.model.config
-        ps = cfg.patch_size
-        num_reg = getattr(cfg, "num_register_tokens", 0)
-        drop_front = 1 + num_reg  # CLS token + register tokens
-        h_p, w_p = res // ps, res // ps
+        patch_size = int(cfg.patch_size)
+        num_reg = int(getattr(cfg, "num_register_tokens", 0))
+        drop_front = 1 + num_reg
+        h_p = res // patch_size
+        w_p = res // patch_size
         n_expected = h_p * w_p
         batch_size = inputs.pixel_values.shape[0]
 
-        # 4. Saliency Mask Extraction
         saliency_mask = self._get_saliency_mask(
-            attentions,
+            outputs.attentions,
             dino_saliency_layer,
             num_reg,
             drop_front,
@@ -209,9 +216,8 @@ class FeatureExtractor:
             w_p,
         )
 
-        # 5. Feature Aggregation
         fused_tokens = self._aggregate_layers(
-            hidden_states,
+            outputs.hidden_states,
             layers,
             grouped_layers,
             agg_method,
