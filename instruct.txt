@@ -3,24 +3,17 @@ python main.py \
     --dataset_name wafer \
     --train_root /workspace/data/develop \
     --val_root /workspace/data/develop \
-    --test_root /workspace/data/develop \
+    --test_root /workspace/data/develop_NG_list \
     --feature_source anomalyvfm \
     --anomalyvfm_ckpt /workspace/Venessa/AnomalyVFM_/pretrained_models/anomalyvfm_dinov2.pkl \
     --anomalyvfm_variant a1_adapted_final \
     --image_res 672 \
-    --k_shot 4 \
     --aug_count 30 \
     --aug_list rotation \
-    --aud_method mean \
-    --pca_ev 0.99 \
-    --score_method reconstruction \
-    --img_score_agg mtop1p \
     --threshold_policy fpr_constrained \
     --target_img_fpr 0.01 \
-    --batch_size 1 \
     --save_intro_overlays \
-    --seed 42 \
-    --outdir ./fewshot_results/wafer \
+    --outdir ./fullshot_results/wafer \
     --fixed_heatmap_scale \
     --fixed_heatmap_vmin 0 \
     --fixed_heatmap_vmax 50 \

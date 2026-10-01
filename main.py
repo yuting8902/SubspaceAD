@@ -405,9 +405,9 @@ def _build_run_name(args):
         )
     if args.k_shot is not None:
         run_name += f"_k{args.k_shot}"
-        if args.aug_count > 0 and args.aug_list:
-            aug_str = "".join(sorted([a[0] for a in args.aug_list]))
-            run_name += f"_aug{args.aug_count}x{aug_str}"
+    if args.aug_count > 0 and args.aug_list:
+        aug_str = "".join(sorted([a[0] for a in args.aug_list]))
+        run_name += f"_aug{args.aug_count}x{aug_str}"
     run_name += f"_seed{args.seed}"
     return run_name
 
@@ -1007,7 +1007,7 @@ def main():
                 logging.info("K-shot image %d/%d: %s", idx, len(train_paths), Path(path).name)
 
         aug_transform = None
-        if args.k_shot is not None and args.aug_count > 0 and args.aug_list:
+        if args.aug_count > 0 and args.aug_list:
             aug_transform = get_augmentation_transform(args.aug_list, args.image_res)
             if not aug_transform.transforms:
                 aug_transform = None
