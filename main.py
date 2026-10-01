@@ -224,6 +224,15 @@ def _pick_threshold_with_fallback(
     has_normal = np.any(y_true == 0)
     has_anomaly = np.any(y_true == 1)
 
+    if threshold_policy == "normal_quantile":
+        if has_normal:
+            threshold = _quantile_threshold_from_negatives(
+                y_true, y_score, target_fpr
+            )
+            if threshold is not None:
+                return threshold, "normal_quantile"
+        return None, "none"
+
     if has_normal and has_anomaly:
         if threshold_policy == "best_f1":
             threshold, _ = _best_f1_threshold_from_scores(y_true, y_score)
@@ -374,7 +383,7 @@ def _build_run_name(args):
     run_name += f"_pca_ev{args.pca_ev}" if args.pca_ev is not None else f"_pca_dim{args.pca_dim}"
     run_name += f"_i-score{args.img_score_agg}"
     run_name += f"_thr-{args.threshold_policy}"
-    if args.threshold_policy == "fpr_constrained":
+    if args.threshold_policy in {"normal_quantile", "fpr_constrained"}:
         run_name += f"-fpr{args.target_img_fpr:g}"
     if args.use_d1_denoise:
         run_name += (
@@ -937,6 +946,11 @@ def main():
         val_paths_all = handler.get_validation_paths()
         test_paths_all = handler.get_test_paths()
 
+        if args.threshold_policy == "normal_quantile":
+            val_paths_all = [
+                p for p in val_paths_all if handler.get_image_label(p) == 0
+            ]
+
         val_labels_all = [handler.get_image_label(p) for p in val_paths_all]
         test_labels_all = [handler.get_image_label(p) for p in test_paths_all]
         dataset_counts.append(
@@ -1037,9 +1051,10 @@ def main():
         actual_pca_dim = _get_pca_dim(pca_params)
         logging.info("Actual fitted PCA dimension for %s: %s", category, actual_pca_dim)
 
-        # Validation threshold. Mixed normal+anomaly validation can use either
-        # Best-F1 or FPR-constrained selection. Normal-only validation preserves
-        # the original negative-quantile fallback controlled by target_img_fpr.
+        # Validation threshold. normal_quantile uses only normal validation
+        # images; mixed normal+anomaly validation can use Best-F1 or
+        # FPR-constrained selection. Normal-only validation preserves the
+        # original negative-quantile fallback controlled by target_img_fpr.
         # Raw validation scores are saved so score distributions can be analyzed
         # later without re-running DINOv2/PCA inference.
         thr_img = None

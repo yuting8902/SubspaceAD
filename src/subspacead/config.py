@@ -251,12 +251,13 @@ def get_args():
         "--threshold_policy",
         type=str,
         default="best_f1",
-        choices=["best_f1", "fpr_constrained"],
+        choices=["normal_quantile", "best_f1", "fpr_constrained"],
         help=(
-            "Image-level threshold selection for mixed normal+anomaly validation. "
-            "'best_f1' maximizes validation F1. 'fpr_constrained' maximizes "
-            "anomaly recall subject to validation FPR <= --target_img_fpr. "
-            "Normal-only validation keeps the original quantile fallback."
+            "Image-level threshold selection policy. 'normal_quantile' uses only "
+            "normal validation images and selects the (1-target_img_fpr) normal-score "
+            "quantile. 'best_f1' maximizes validation F1 on mixed normal+anomaly "
+            "validation. 'fpr_constrained' maximizes anomaly recall subject to "
+            "validation FPR <= --target_img_fpr."
         ),
     )
     score_group.add_argument(
@@ -264,9 +265,9 @@ def get_args():
         type=float,
         default=0.05,
         help=(
-            "Target image-level validation FPR. Used as the constraint for "
-            "--threshold_policy fpr_constrained and as the normal-only quantile "
-            "fallback target."
+            "Target image-level validation FPR. Used by 'normal_quantile' to choose "
+            "the normal-score quantile, by 'fpr_constrained' as the FPR constraint, "
+            "and as the normal-only fallback target."
         ),
     )
     score_group.add_argument(
