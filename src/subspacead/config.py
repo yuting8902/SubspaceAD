@@ -19,6 +19,9 @@ def _validate_wafer_roots(parser: argparse.ArgumentParser, args):
     if not 0.0 <= args.target_img_fpr <= 1.0:
         parser.error("--target_img_fpr must be in [0, 1].")
 
+    if args.img_score_agg == "mtopk" and not 0.0 < args.topk_frac <= 1.0:
+        parser.error("--topk_frac must be in (0, 1] when --img_score_agg mtopk is used.")
+
     if args.dataset_name != "wafer":
         if not args.dataset_path:
             parser.error("--dataset_path is required for non-wafer datasets.")
@@ -244,7 +247,17 @@ def get_args():
         "--img_score_agg",
         type=str,
         default="mtop1p",
-        choices=["max", "mean", "p99", "mtop5", "mtop1p"],
+        choices=["max", "mean", "p99", "mtop5", "mtop1p", "mtopk"],
+    )
+    score_group.add_argument(
+        "--topk_frac",
+        type=float,
+        default=0.01,
+        help=(
+            "Fraction of highest anomaly-map values averaged when "
+            "--img_score_agg mtopk is used. "
+            "For example, 0.01 = top 1%% and 0.005 = top 0.5%%."
+        ),
     )
     score_group.add_argument("--pro_integration_limit", type=float, default=0.3)
     score_group.add_argument(

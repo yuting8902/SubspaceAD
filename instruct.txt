@@ -10,10 +10,12 @@ python main.py \
     --image_res 672 \
     --aug_count 30 \
     --aug_list rotation \
+    --img_score_agg mtopk \
+    --topk_frac 0.005 \
     --threshold_policy fpr_constrained \
     --target_img_fpr 0.01 \
     --save_intro_overlays \
-    --outdir ./fullshot_results/wafer \
+    --outdir ./full_shot_results/develop_NG_list \
     --fixed_heatmap_scale \
     --fixed_heatmap_vmin 0 \
     --fixed_heatmap_vmax 50 \

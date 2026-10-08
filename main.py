@@ -263,7 +263,11 @@ def _topk_mean(arr, frac=0.01):
     return float(np.mean(flat[idx]))
 
 
-def _aggregate_image_score(anomaly_map: np.ndarray, method: str) -> float:
+def _aggregate_image_score(
+    anomaly_map: np.ndarray,
+    method: str,
+    topk_frac: float = 0.01,
+) -> float:
     if method == "max":
         return float(np.max(anomaly_map))
     if method == "p99":
@@ -272,6 +276,8 @@ def _aggregate_image_score(anomaly_map: np.ndarray, method: str) -> float:
         return float(np.mean(np.sort(anomaly_map.flatten())[-5:]))
     if method == "mtop1p":
         return _topk_mean(anomaly_map, frac=0.01)
+    if method == "mtopk":
+        return _topk_mean(anomaly_map, frac=topk_frac)
     return float(np.mean(anomaly_map))
 
 
@@ -382,6 +388,8 @@ def _build_run_name(args):
         run_name += f"_model-{Path(args.model_ckpt).name}"
     run_name += f"_pca_ev{args.pca_ev}" if args.pca_ev is not None else f"_pca_dim{args.pca_dim}"
     run_name += f"_i-score{args.img_score_agg}"
+    if args.img_score_agg == "mtopk":
+        run_name += f"-k{args.topk_frac:g}"
     run_name += f"_thr-{args.threshold_policy}"
     if args.threshold_policy in {"normal_quantile", "fpr_constrained"}:
         run_name += f"-fpr{args.target_img_fpr:g}"
@@ -1076,7 +1084,13 @@ def main():
                 )
                 for path, anomaly_map in zip(path_batch, maps):
                     val_score_paths.append(path)
-                    val_scores.append(_aggregate_image_score(anomaly_map, args.img_score_agg))
+                    val_scores.append(
+                        _aggregate_image_score(
+                            anomaly_map,
+                            args.img_score_agg,
+                            args.topk_frac,
+                        )
+                    )
                     val_labels.append(handler.get_image_label(path))
 
             thr_img, how_img = _pick_threshold_with_fallback(
@@ -1173,7 +1187,11 @@ def main():
                     w_p,
                     feature_dim,
                 )
-                _ = _aggregate_image_score(maps[0], args.img_score_agg)
+                _ = _aggregate_image_score(
+                    maps[0],
+                    args.img_score_agg,
+                    args.topk_frac,
+                )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize(DEVICE)
             except Exception as exc:
@@ -1205,7 +1223,11 @@ def main():
                 feature_dim,
             )
             batch_scores = [
-                _aggregate_image_score(anomaly_map, args.img_score_agg)
+                _aggregate_image_score(
+                    anomaly_map,
+                    args.img_score_agg,
+                    args.topk_frac,
+                )
                 for anomaly_map in maps
             ]
 
